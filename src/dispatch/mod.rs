@@ -6,7 +6,7 @@ mod route;
 pub use route::{match_route, path_only};
 pub use vhost::select_site;
 
-use crate::content::{serve_get, site_error};
+use crate::content::{handle_delete, handle_post, serve_get, site_error};
 use crate::http::{Inbound, Outbound, Status};
 use crate::settings::{HttpMethod, SiteBundle};
 use std::net::SocketAddr;
@@ -41,19 +41,8 @@ pub fn answer(listen: SocketAddr, req: &Inbound, bundle: &SiteBundle) -> Outboun
             match method {
                 HttpMethod::Get => serve_get(site, rule, &path, false),
                 HttpMethod::Head => serve_get(site, rule, &path, true),
-                HttpMethod::Post => Outbound::text(
-                    Status::OK,
-                    format!(
-                        "POST stub path={} body_bytes={} prefix={}\n",
-                        path,
-                        req.body.len(),
-                        rule.prefix
-                    ),
-                ),
-                HttpMethod::Delete => Outbound::text(
-                    Status::OK,
-                    format!("DELETE stub path={} prefix={}\n", path, rule.prefix),
-                ),
+                HttpMethod::Post => handle_post(site, rule, req),
+                HttpMethod::Delete => handle_delete(site, rule, &path),
                 _ => site_error(site, Status::METHOD_NOT_ALLOWED),
             }
         }

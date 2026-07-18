@@ -5,6 +5,8 @@ pub struct Status;
 
 impl Status {
     pub const OK: u16 = 200;
+    pub const CREATED: u16 = 201;
+    pub const NO_CONTENT: u16 = 204;
     pub const BAD_REQUEST: u16 = 400;
     pub const FORBIDDEN: u16 = 403;
     pub const NOT_FOUND: u16 = 404;

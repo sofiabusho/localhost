@@ -10,6 +10,13 @@
     <p class="brand">localhost</p>
     <h1>It works</h1>
     <p>Static pages from the sample document root.</p>
+    <form action="/" method="post" enctype="multipart/form-data" style="margin-top:2rem">
+      <label>Upload a file
+        <input type="file" name="file" required>
+      </label>
+      <button type="submit">Send</button>
+    </form>
+    <p style="margin-top:1rem"><a href="/uploads/">Browse uploads</a></p>
   </main>
 </body>
 </html>
