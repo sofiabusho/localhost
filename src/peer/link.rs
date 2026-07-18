@@ -5,10 +5,13 @@ use crate::content::site_error;
 use crate::dispatch;
 use crate::dispatch::select_site;
 use crate::http::{try_parse, DecodeError, Outbound, Status};
+use crate::session::{self, Vault};
 use crate::settings::SiteBundle;
+use std::cell::RefCell;
 use std::io::{self, ErrorKind};
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -64,6 +67,7 @@ pub struct Peer {
     timing: Timing,
     max_body: u64,
     sites: Arc<SiteBundle>,
+    sessions: Rc<RefCell<Vault>>,
 }
 
 impl Peer {
@@ -74,6 +78,7 @@ impl Peer {
         timing: Timing,
         max_body: u64,
         sites: Arc<SiteBundle>,
+        sessions: Rc<RefCell<Vault>>,
     ) -> Self {
         let now = Instant::now();
         Self {
@@ -89,6 +94,7 @@ impl Peer {
             timing,
             max_body,
             sites,
+            sessions,
         }
     }
 
@@ -146,11 +152,36 @@ impl Peer {
                 PeerOutcome::Ok(PeerAction::WantSend)
             }
             Ok((msg, _consumed)) => {
-                let resp = dispatch::answer(self.listen_addr, &msg, &self.sites);
+                let mut resp = dispatch::answer(self.listen_addr, &msg, &self.sites);
+                resp = self.stamp_session(msg.header("cookie"), resp);
                 self.reply(resp);
                 PeerOutcome::Ok(PeerAction::WantSend)
             }
         }
+    }
+
+    fn stamp_session(&self, cookie_header: Option<&str>, mut resp: Outbound) -> Outbound {
+        let mut vault = self.sessions.borrow_mut();
+        let sid = vault.resume_or_mint(cookie_header);
+        if let Some(bag) = vault.bag_mut(&sid) {
+            let hits: u64 = bag
+                .get("hits")
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0)
+                .saturating_add(1);
+            bag.set("hits", hits.to_string());
+            resp.headers
+                .retain(|(k, _)| !k.eq_ignore_ascii_case("x-session-hits"));
+            resp.headers
+                .push(("X-Session-Hits".into(), hits.to_string()));
+        }
+        resp.headers.retain(|(k, v)| {
+            !(k.eq_ignore_ascii_case("set-cookie")
+                && v.to_ascii_lowercase().starts_with("session_id="))
+        });
+        resp.headers
+            .push(("Set-Cookie".into(), session::set_cookie_header(&sid)));
+        resp
     }
 
     fn reply(&mut self, resp: Outbound) {
@@ -161,10 +192,11 @@ impl Peer {
     }
 
     fn parse_error(&self, code: u16) -> Outbound {
-        match select_site(&self.sites, self.listen_addr, None) {
+        let resp = match select_site(&self.sites, self.listen_addr, None) {
             Some(site) => site_error(site, code),
             None => Outbound::error(code),
-        }
+        };
+        self.stamp_session(None, resp)
     }
 
     /// At most one `send` syscall. Call only when epoll reported writable.

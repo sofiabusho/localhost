@@ -7,6 +7,7 @@ mod http;
 mod content;
 mod dispatch;
 mod peer;
+mod session;
 mod hub;
 
 use std::env;

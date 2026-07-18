@@ -3,12 +3,15 @@
 use crate::ingress::Listener;
 use crate::multiplex::{Interest, WaitSet};
 use crate::peer::{Peer, PeerAction, PeerOutcome, Timing};
+use crate::session::Vault;
 use crate::settings::SiteBundle;
 use libc::epoll_event;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -21,6 +24,7 @@ pub fn run(bundle: SiteBundle) -> Result<(), String> {
         addrs.extend(site.binds.iter().copied());
     }
     let bundle = Arc::new(bundle);
+    let sessions = Rc::new(RefCell::new(Vault::new()));
 
     let listeners = crate::ingress::open_listeners(&addrs)?;
     let wait = WaitSet::create().map_err(|e| format!("epoll_create1 failed: {e}"))?;
@@ -57,6 +61,7 @@ pub fn run(bundle: SiteBundle) -> Result<(), String> {
                         &listeners_by_fd,
                         &mut peers,
                         &bundle,
+                        &sessions,
                         ev.fd,
                         timing,
                     );
@@ -106,6 +111,7 @@ pub fn run(bundle: SiteBundle) -> Result<(), String> {
             }
         }
 
+        sessions.borrow_mut().sweep();
         reap_timeouts(&wait, &mut peers, now);
     }
 }
@@ -115,6 +121,7 @@ fn accept_drain(
     listeners: &HashMap<RawFd, Listener>,
     peers: &mut HashMap<RawFd, Peer>,
     bundle: &Arc<SiteBundle>,
+    sessions: &Rc<RefCell<Vault>>,
     listen_fd: RawFd,
     timing: Timing,
 ) {
@@ -140,6 +147,7 @@ fn accept_drain(
                     timing,
                     max_body,
                     Arc::clone(bundle),
+                    Rc::clone(sessions),
                 );
                 peers.insert(fd, peer);
             }
