@@ -2,14 +2,11 @@
 //! epoll_create1 / epoll_ctl / epoll_wait wrapper.
 
 use libc::{
-    self, c_int, epoll_event, EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLOUT, EPOLLET,
-    EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD,
+    self, c_int, epoll_event, EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLOUT, EPOLL_CTL_ADD,
+    EPOLL_CTL_DEL, EPOLL_CTL_MOD,
 };
 use std::io::{self, Error};
 use std::os::fd::{AsRawFd, RawFd};
-
-/// Edge-triggered by default so readiness is explicit and we never busy-spin.
-const FLAGS: u32 = EPOLLET as u32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Interest {
@@ -22,6 +19,13 @@ impl Interest {
         Self {
             read: true,
             write: false,
+        }
+    }
+
+    pub fn write_only() -> Self {
+        Self {
+            read: false,
+            write: true,
         }
     }
 
@@ -40,7 +44,9 @@ impl Interest {
         if self.write {
             e |= EPOLLOUT as u32;
         }
-        e | FLAGS | (EPOLLERR as u32) | (EPOLLHUP as u32)
+        // Level-triggered: stays ready until the condition clears, so the hub
+        // can honor "one read/write attempt per wake" without missing bytes.
+        e | (EPOLLERR as u32) | (EPOLLHUP as u32)
     }
 }
 
@@ -88,7 +94,6 @@ impl WaitSet {
             events: interest.as_events(),
             u64: token,
         };
-        // On some targets epoll_event layout uses a union; libc crate exposes `u64`.
         let rc = unsafe { libc::epoll_ctl(self.epfd, op, fd, &mut ev) };
         if rc < 0 {
             return Err(Error::last_os_error());

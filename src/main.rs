@@ -3,6 +3,7 @@
 mod settings;
 mod multiplex;
 mod ingress;
+mod peer;
 mod hub;
 
 use std::env;
