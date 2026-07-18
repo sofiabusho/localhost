@@ -9,3 +9,5 @@
 /tests/tmp/
 /www/uploads/
 /www/delete_me.txt
+/cpp/build/
+/cpp/localhost_cpp
