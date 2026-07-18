@@ -1,17 +1,16 @@
 #![allow(dead_code)] // listen_addr used from Phase 5
 //! Per-client buffers, phases, and timeout bookkeeping.
 
+use crate::http::{try_parse, DecodeError, Outbound, Status};
 use std::io::{self, ErrorKind};
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
-/// Soft limits for slow / idle clients (Phase 3).
+/// Soft limits for slow / idle clients.
 #[derive(Debug, Clone, Copy)]
 pub struct Timing {
-    /// Max time from accept until a full request head is seen.
     pub request: Duration,
-    /// Max time between successful I/O activity.
     pub idle: Duration,
 }
 
@@ -26,13 +25,10 @@ impl Default for Timing {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
-    /// Gathering bytes until headers terminator (stub until Phase 4).
     Recv,
-    /// Flushing a prepared response.
     Send,
 }
 
-/// What the hub should do to epoll interest after a step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerAction {
     KeepRecv,
@@ -46,7 +42,7 @@ pub enum PeerOutcome {
     Drop,
 }
 
-const MAX_IN: usize = 64 * 1024;
+const MAX_IN: usize = 1024 * 1024; // hard ceiling on in-flight buffer (body limit is separate)
 const READ_CHUNK: usize = 8 * 1024;
 const WRITE_CHUNK: usize = 8 * 1024;
 
@@ -61,10 +57,17 @@ pub struct Peer {
     born: Instant,
     last_io: Instant,
     timing: Timing,
+    max_body: u64,
 }
 
 impl Peer {
-    pub fn new(fd: OwnedFd, peer_addr: SocketAddr, listen_addr: SocketAddr, timing: Timing) -> Self {
+    pub fn new(
+        fd: OwnedFd,
+        peer_addr: SocketAddr,
+        listen_addr: SocketAddr,
+        timing: Timing,
+        max_body: u64,
+    ) -> Self {
         let now = Instant::now();
         Self {
             fd,
@@ -77,6 +80,7 @@ impl Peer {
             born: now,
             last_io: now,
             timing,
+            max_body,
         }
     }
 
@@ -102,10 +106,7 @@ impl Peer {
 
         let mut tmp = [0u8; READ_CHUNK];
         let n = match recv_once(self.fd.as_raw_fd(), &mut tmp) {
-            Ok(0) => {
-                // Peer closed before a complete request.
-                return PeerOutcome::Drop;
-            }
+            Ok(0) => return PeerOutcome::Drop,
             Ok(n) => n,
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
                 return PeerOutcome::Ok(PeerAction::KeepRecv);
@@ -118,18 +119,43 @@ impl Peer {
 
         self.last_io = Instant::now();
         if self.inbuf.len() + n > MAX_IN {
-            // Oversized head — close for now; Phase 4 maps this to 413.
-            return PeerOutcome::Drop;
+            self.reply(Outbound::error(Status::PAYLOAD_TOO_LARGE));
+            return PeerOutcome::Ok(PeerAction::WantSend);
         }
         self.inbuf.extend_from_slice(&tmp[..n]);
+        self.try_finish_request()
+    }
 
-        if headers_complete(&self.inbuf) {
-            self.prepare_stub_response();
-            self.phase = Phase::Send;
-            PeerOutcome::Ok(PeerAction::WantSend)
-        } else {
-            PeerOutcome::Ok(PeerAction::KeepRecv)
+    fn try_finish_request(&mut self) -> PeerOutcome {
+        match try_parse(&self.inbuf, self.max_body) {
+            Err(DecodeError::Incomplete) => PeerOutcome::Ok(PeerAction::KeepRecv),
+            Err(DecodeError::BadRequest(_)) => {
+                self.reply(Outbound::error(Status::BAD_REQUEST));
+                PeerOutcome::Ok(PeerAction::WantSend)
+            }
+            Err(DecodeError::PayloadTooLarge) => {
+                self.reply(Outbound::error(Status::PAYLOAD_TOO_LARGE));
+                PeerOutcome::Ok(PeerAction::WantSend)
+            }
+            Ok((msg, _consumed)) => {
+                // Phase 4: acknowledge a well-formed message (routing in Phase 5).
+                let body = format!(
+                    "OK {} {}\nbody_bytes={}\n",
+                    msg.method,
+                    msg.target,
+                    msg.body.len()
+                );
+                self.reply(Outbound::text(Status::OK, body));
+                PeerOutcome::Ok(PeerAction::WantSend)
+            }
         }
+    }
+
+    fn reply(&mut self, resp: Outbound) {
+        self.outbuf = resp.to_bytes();
+        self.out_off = 0;
+        self.phase = Phase::Send;
+        self.inbuf.clear();
     }
 
     /// At most one `send` syscall. Call only when epoll reported writable.
@@ -155,44 +181,15 @@ impl Peer {
                     PeerOutcome::Ok(PeerAction::WantSend)
                 }
             }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                PeerOutcome::Ok(PeerAction::WantSend)
-            }
-            Err(e) if e.kind() == ErrorKind::Interrupted => {
-                PeerOutcome::Ok(PeerAction::WantSend)
-            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => PeerOutcome::Ok(PeerAction::WantSend),
+            Err(e) if e.kind() == ErrorKind::Interrupted => PeerOutcome::Ok(PeerAction::WantSend),
             Err(_) => PeerOutcome::Drop,
         }
     }
-
-    fn prepare_stub_response(&mut self) {
-        // Phase 3 debug response — replaced by real HTTP builder in Phase 4.
-        let body = b"localhost phase3: request head received\n";
-        let mut msg = Vec::new();
-        msg.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
-        msg.extend_from_slice(b"Content-Type: text/plain; charset=utf-8\r\n");
-        msg.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
-        msg.extend_from_slice(b"Connection: close\r\n");
-        msg.extend_from_slice(b"\r\n");
-        msg.extend_from_slice(body);
-        self.outbuf = msg;
-        self.out_off = 0;
-    }
-}
-
-fn headers_complete(buf: &[u8]) -> bool {
-    buf.windows(4).any(|w| w == b"\r\n\r\n")
 }
 
 fn recv_once(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
-    let n = unsafe {
-        libc::recv(
-            fd,
-            buf.as_mut_ptr() as *mut libc::c_void,
-            buf.len(),
-            0,
-        )
-    };
+    let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
     if n < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -213,16 +210,5 @@ fn send_once(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
         Err(io::Error::last_os_error())
     } else {
         Ok(n as usize)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::headers_complete;
-
-    #[test]
-    fn detects_header_terminator() {
-        assert!(!headers_complete(b"GET / HTTP/1.1\r\nHost: x\r\n"));
-        assert!(headers_complete(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"));
     }
 }

@@ -7,6 +7,7 @@ use crate::settings::SiteBundle;
 use libc::epoll_event;
 use std::collections::HashMap;
 use std::io::ErrorKind;
+use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::Instant;
 
@@ -40,7 +41,6 @@ pub fn run(bundle: &SiteBundle) -> Result<(), String> {
     );
 
     loop {
-        // Sole blocking wait-point for all sockets in this process.
         let ready = wait
             .wait(&mut events, WAIT_SLICE_MS)
             .map_err(|e| format!("epoll_wait failed: {e}"))?;
@@ -50,8 +50,14 @@ pub fn run(bundle: &SiteBundle) -> Result<(), String> {
         for ev in ready {
             if listeners_by_fd.contains_key(&ev.fd) {
                 if ev.readable {
-                    // Re-borrow separately to avoid holding listeners across peer mut.
-                    accept_drain(&wait, &listeners_by_fd, &mut peers, ev.fd, timing);
+                    accept_drain(
+                        &wait,
+                        &listeners_by_fd,
+                        &mut peers,
+                        bundle,
+                        ev.fd,
+                        timing,
+                    );
                 }
                 continue;
             }
@@ -65,7 +71,6 @@ pub fn run(bundle: &SiteBundle) -> Result<(), String> {
                 continue;
             }
 
-            // At most one read attempt and one write attempt per wake for this fd.
             let mut action = PeerAction::KeepRecv;
             let mut dead = false;
 
@@ -107,6 +112,7 @@ fn accept_drain(
     wait: &WaitSet,
     listeners: &HashMap<RawFd, Listener>,
     peers: &mut HashMap<RawFd, Peer>,
+    bundle: &SiteBundle,
     listen_fd: RawFd,
     timing: Timing,
 ) {
@@ -114,6 +120,7 @@ fn accept_drain(
         return;
     };
     let listen_addr = listener.addr();
+    let max_body = max_body_for(bundle, listen_addr);
 
     loop {
         match listener.accept_nonblocking() {
@@ -124,7 +131,7 @@ fn accept_drain(
                     drop(client);
                     continue;
                 }
-                let peer = Peer::new(client, peer_addr, listen_addr, timing);
+                let peer = Peer::new(client, peer_addr, listen_addr, timing, max_body);
                 peers.insert(fd, peer);
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -137,10 +144,18 @@ fn accept_drain(
     }
 }
 
+fn max_body_for(bundle: &SiteBundle, addr: SocketAddr) -> u64 {
+    for site in &bundle.sites {
+        if site.binds.contains(&addr) {
+            return site.max_body.bytes();
+        }
+    }
+    1024 * 1024
+}
+
 fn drop_peer(wait: &WaitSet, peers: &mut HashMap<RawFd, Peer>, fd: RawFd) {
     if peers.remove(&fd).is_some() {
         let _ = wait.remove(fd);
-        // OwnedFd drop closes the socket.
     }
 }
 
