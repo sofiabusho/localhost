@@ -179,6 +179,37 @@ mod tests {
     }
 
     #[test]
+    fn cgi_extension_routes_to_handler() {
+        use crate::content::cgi_matches;
+        use crate::settings::PathRule;
+        use std::path::PathBuf;
+
+        let mut rule = PathRule::new("/cgi-bin".into());
+        rule.methods = vec![HttpMethod::Get, HttpMethod::Post];
+        rule.root = Some(PathBuf::from("www/cgi"));
+        rule.cgi_ext = Some(".py".into());
+        rule.cgi_bin = Some(PathBuf::from("/usr/bin/python3"));
+        assert!(cgi_matches(&rule, "/cgi-bin/hello.py"));
+        assert!(!cgi_matches(&rule, "/cgi-bin/readme.txt"));
+
+        if !PathBuf::from("www/cgi/hello.py").is_file()
+            || !PathBuf::from("/usr/bin/python3").is_file()
+        {
+            return;
+        }
+        let mut site = SiteBlock::default();
+        site.binds = vec!["127.0.0.1:8080".parse().unwrap()];
+        site.hostnames = vec!["localhost".into()];
+        site.paths = vec![rule];
+        let bundle = SiteBundle { sites: vec![site] };
+        let listen: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let out = answer(listen, &req("GET", "/cgi-bin/hello.py", "localhost"), &bundle);
+        assert_eq!(out.status, 200);
+        let body = String::from_utf8_lossy(&out.body);
+        assert!(body.contains("REQUEST_METHOD=GET"));
+    }
+
+    #[test]
     fn get_serves_index_when_www_present() {
         let b = bundle();
         let listen: SocketAddr = "127.0.0.1:8080".parse().unwrap();

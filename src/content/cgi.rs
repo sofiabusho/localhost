@@ -13,7 +13,9 @@ use std::ffi::CString;
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::RawFd;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::ptr;
 use std::time::{Duration, Instant};
 

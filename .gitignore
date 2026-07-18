@@ -6,3 +6,6 @@
 *.log
 /tmp/
 /uploads/
+/tests/tmp/
+/www/uploads/
+/www/delete_me.txt
