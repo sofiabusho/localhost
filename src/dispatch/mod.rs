@@ -6,11 +6,12 @@ mod route;
 pub use route::{match_route, path_only};
 pub use vhost::select_site;
 
+use crate::content::{serve_get, site_error};
 use crate::http::{Inbound, Outbound, Status};
 use crate::settings::{HttpMethod, SiteBundle};
 use std::net::SocketAddr;
 
-/// Resolve Host + URI against the config and build a Phase-5 response.
+/// Resolve Host + URI against the config and build a response.
 pub fn answer(listen: SocketAddr, req: &Inbound, bundle: &SiteBundle) -> Outbound {
     let Some(site) = select_site(bundle, listen, req.header("host")) else {
         return Outbound::error(Status::INTERNAL);
@@ -18,7 +19,7 @@ pub fn answer(listen: SocketAddr, req: &Inbound, bundle: &SiteBundle) -> Outboun
 
     let path = path_only(&req.target);
     match match_route(site, &path) {
-        None => Outbound::error(Status::NOT_FOUND),
+        None => site_error(site, Status::NOT_FOUND),
         Some(rule) => {
             let method = HttpMethod::parse(&req.method);
             if !rule.methods.iter().any(|m| *m == method) {
@@ -28,7 +29,7 @@ pub fn answer(listen: SocketAddr, req: &Inbound, bundle: &SiteBundle) -> Outboun
                     .map(|m| m.as_str())
                     .collect::<Vec<_>>()
                     .join(", ");
-                return Outbound::error(Status::METHOD_NOT_ALLOWED).header("Allow", allow);
+                return site_error(site, Status::METHOD_NOT_ALLOWED).header("Allow", allow);
             }
 
             if let Some(redir) = &rule.redirect {
@@ -37,20 +38,9 @@ pub fn answer(listen: SocketAddr, req: &Inbound, bundle: &SiteBundle) -> Outboun
                     .header("Content-Length", "0");
             }
 
-            // Stubs until Phase 6+ (static / upload / CGI).
             match method {
-                HttpMethod::Get => Outbound::text(
-                    Status::OK,
-                    format!("GET stub path={} prefix={}\n", path, rule.prefix),
-                ),
-                HttpMethod::Head => {
-                    let mut r = Outbound::text(
-                        Status::OK,
-                        format!("GET stub path={} prefix={}\n", path, rule.prefix),
-                    );
-                    r.body.clear();
-                    r
-                }
+                HttpMethod::Get => serve_get(site, rule, &path, false),
+                HttpMethod::Head => serve_get(site, rule, &path, true),
                 HttpMethod::Post => Outbound::text(
                     Status::OK,
                     format!(
@@ -64,7 +54,7 @@ pub fn answer(listen: SocketAddr, req: &Inbound, bundle: &SiteBundle) -> Outboun
                     Status::OK,
                     format!("DELETE stub path={} prefix={}\n", path, rule.prefix),
                 ),
-                _ => Outbound::error(Status::METHOD_NOT_ALLOWED),
+                _ => site_error(site, Status::METHOD_NOT_ALLOWED),
             }
         }
     }
@@ -86,6 +76,7 @@ mod tests {
         let mut root = PathRule::new("/".into());
         root.methods = vec![HttpMethod::Get, HttpMethod::Post];
         root.root = Some(PathBuf::from("www"));
+        root.index = Some("index.html".into());
         let mut old = PathRule::new("/old".into());
         old.methods = vec![HttpMethod::Get];
         old.redirect = Some(RedirectRule {
@@ -101,7 +92,6 @@ mod tests {
 
     fn site_b() -> SiteBlock {
         let mut s = SiteBlock::default();
-        // Same bind — unit tests exercise Host pick without going through validate().
         s.binds = vec!["127.0.0.1:8080".parse().unwrap()];
         s.hostnames = vec!["beta.local".into()];
         let mut root = PathRule::new("/".into());
@@ -137,7 +127,6 @@ mod tests {
         assert_eq!(a.hostnames[0], "alpha.local");
         let beta = select_site(&b, listen, Some("beta.local")).unwrap();
         assert_eq!(beta.hostnames[0], "beta.local");
-        // Unknown Host → first site for this bind (default).
         let def = select_site(&b, listen, Some("unknown.test")).unwrap();
         assert_eq!(def.hostnames[0], "alpha.local");
     }
@@ -189,5 +178,23 @@ mod tests {
     fn path_only_strips_query() {
         assert_eq!(path_only("/old?x=1"), "/old");
         assert_eq!(path_only("/"), "/");
+    }
+
+    #[test]
+    fn get_serves_index_when_www_present() {
+        let b = bundle();
+        let listen: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        // Relies on repo www/index.html when tests run from crate root.
+        if !PathBuf::from("www/index.html").is_file() {
+            return;
+        }
+        let out = answer(listen, &req("GET", "/", "alpha.local"), &b);
+        assert_eq!(out.status, 200);
+        assert!(out
+            .headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("Content-Type") && v.contains("text/html")));
+        let body = String::from_utf8_lossy(&out.body);
+        assert!(body.contains("localhost") || body.contains("It works"));
     }
 }

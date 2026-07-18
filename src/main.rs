@@ -4,6 +4,7 @@ mod settings;
 mod multiplex;
 mod ingress;
 mod http;
+mod content;
 mod dispatch;
 mod peer;
 mod hub;

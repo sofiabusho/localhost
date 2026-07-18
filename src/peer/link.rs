@@ -1,7 +1,9 @@
 #![allow(dead_code)]
 //! Per-client buffers, phases, and timeout bookkeeping.
 
+use crate::content::site_error;
 use crate::dispatch;
+use crate::dispatch::select_site;
 use crate::http::{try_parse, DecodeError, Outbound, Status};
 use crate::settings::SiteBundle;
 use std::io::{self, ErrorKind};
@@ -125,7 +127,7 @@ impl Peer {
 
         self.last_io = Instant::now();
         if self.inbuf.len() + n > MAX_IN {
-            self.reply(Outbound::error(Status::PAYLOAD_TOO_LARGE));
+            self.reply(self.parse_error(Status::PAYLOAD_TOO_LARGE));
             return PeerOutcome::Ok(PeerAction::WantSend);
         }
         self.inbuf.extend_from_slice(&tmp[..n]);
@@ -136,11 +138,11 @@ impl Peer {
         match try_parse(&self.inbuf, self.max_body) {
             Err(DecodeError::Incomplete) => PeerOutcome::Ok(PeerAction::KeepRecv),
             Err(DecodeError::BadRequest(_)) => {
-                self.reply(Outbound::error(Status::BAD_REQUEST));
+                self.reply(self.parse_error(Status::BAD_REQUEST));
                 PeerOutcome::Ok(PeerAction::WantSend)
             }
             Err(DecodeError::PayloadTooLarge) => {
-                self.reply(Outbound::error(Status::PAYLOAD_TOO_LARGE));
+                self.reply(self.parse_error(Status::PAYLOAD_TOO_LARGE));
                 PeerOutcome::Ok(PeerAction::WantSend)
             }
             Ok((msg, _consumed)) => {
@@ -156,6 +158,13 @@ impl Peer {
         self.out_off = 0;
         self.phase = Phase::Send;
         self.inbuf.clear();
+    }
+
+    fn parse_error(&self, code: u16) -> Outbound {
+        match select_site(&self.sites, self.listen_addr, None) {
+            Some(site) => site_error(site, code),
+            None => Outbound::error(code),
+        }
     }
 
     /// At most one `send` syscall. Call only when epoll reported writable.
