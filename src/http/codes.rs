@@ -13,6 +13,7 @@ impl Status {
     pub const METHOD_NOT_ALLOWED: u16 = 405;
     pub const PAYLOAD_TOO_LARGE: u16 = 413;
     pub const INTERNAL: u16 = 500;
+    pub const GATEWAY_TIMEOUT: u16 = 504;
 }
 
 pub fn reason_phrase(code: u16) -> &'static str {
@@ -28,6 +29,7 @@ pub fn reason_phrase(code: u16) -> &'static str {
         405 => "Method Not Allowed",
         413 => "Payload Too Large",
         500 => "Internal Server Error",
+        504 => "Gateway Timeout",
         _ => "Error",
     }
 }

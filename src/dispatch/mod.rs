@@ -6,7 +6,7 @@ mod route;
 pub use route::{match_route, path_only};
 pub use vhost::select_site;
 
-use crate::content::{handle_delete, handle_post, serve_get, site_error};
+use crate::content::{cgi_matches, handle_cgi, handle_delete, handle_post, serve_get, site_error};
 use crate::http::{Inbound, Outbound, Status};
 use crate::settings::{HttpMethod, SiteBundle};
 use std::net::SocketAddr;
@@ -36,6 +36,11 @@ pub fn answer(listen: SocketAddr, req: &Inbound, bundle: &SiteBundle) -> Outboun
                 return Outbound::new(redir.status)
                     .header("Location", redir.target.clone())
                     .header("Content-Length", "0");
+            }
+
+            if cgi_matches(rule, &path) {
+                let head_only = matches!(method, HttpMethod::Head);
+                return handle_cgi(site, rule, req, &path, listen, head_only);
             }
 
             match method {

@@ -46,6 +46,11 @@ impl Outbound {
         self
     }
 
+    pub fn with_body(mut self, body: Vec<u8>) -> Self {
+        self.body = body;
+        self
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let reason = reason_phrase(self.status);
         let mut out = Vec::with_capacity(128 + self.body.len());
