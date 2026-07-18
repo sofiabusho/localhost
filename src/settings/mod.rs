@@ -6,7 +6,7 @@ mod verify;
 
 #[allow(unused_imports)]
 pub use schema::{
-    BodyLimit, ErrPageMap, HttpMethod, PathRule, RedirectRule, SiteBlock, SiteBundle,
+    BodyLimit, CgiProg, ErrPageMap, HttpMethod, PathRule, RedirectRule, SiteBlock, SiteBundle,
 };
 #[allow(unused_imports)]
 #[allow(unused_imports)]
@@ -185,6 +185,7 @@ site {
         methods GET POST;
         root www/api;
         cgi .py /usr/bin/python3;
+        cgi .sh /bin/bash;
         upload www/uploads;
         autoindex on;
     }
@@ -193,7 +194,7 @@ site {
         let b = parse_ok(src);
         assert_eq!(b.sites[0].paths.len(), 2);
         assert!(b.sites[0].paths[0].redirect.is_some());
-        assert!(b.sites[0].paths[1].cgi_ext.is_some());
+        assert_eq!(b.sites[0].paths[1].cgi.len(), 2);
         assert_eq!(b.sites[0].paths[1].autoindex, true);
     }
 

@@ -124,6 +124,13 @@ pub struct RedirectRule {
     pub target: String,
 }
 
+/// One CGI interpreter mapped to a file extension (`cgi .py /usr/bin/python3`).
+#[derive(Debug, Clone)]
+pub struct CgiProg {
+    pub ext: String,
+    pub bin: PathBuf,
+}
+
 /// One `path /prefix { ... }` route.
 #[derive(Debug, Clone)]
 pub struct PathRule {
@@ -133,8 +140,7 @@ pub struct PathRule {
     pub index: Option<String>,
     pub autoindex: bool,
     pub redirect: Option<RedirectRule>,
-    pub cgi_ext: Option<String>,
-    pub cgi_bin: Option<PathBuf>,
+    pub cgi: Vec<CgiProg>,
     pub upload_dir: Option<PathBuf>,
 }
 
@@ -147,9 +153,20 @@ impl PathRule {
             index: None,
             autoindex: false,
             redirect: None,
-            cgi_ext: None,
-            cgi_bin: None,
+            cgi: Vec::new(),
             upload_dir: None,
         }
+    }
+
+    /// Interpreter for `url_path` when the extension matches a configured CGI.
+    pub fn cgi_for(&self, url_path: &str) -> Option<&CgiProg> {
+        let path = url_path.split('?').next().unwrap_or(url_path);
+        let file_ext = std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())?
+            .to_ascii_lowercase();
+        self.cgi.iter().find(|prog| {
+            prog.ext.trim_start_matches('.').eq_ignore_ascii_case(&file_ext)
+        })
     }
 }

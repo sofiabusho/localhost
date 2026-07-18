@@ -22,18 +22,9 @@ use std::time::{Duration, Instant};
 const CGI_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_CHUNK: usize = 8 * 1024;
 
-/// True when this route has CGI configured and `url_path` ends with that extension.
+/// True when this route has a CGI mapping for the request path extension.
 pub fn matches_route(rule: &PathRule, url_path: &str) -> bool {
-    let (Some(ext), Some(_)) = (&rule.cgi_ext, &rule.cgi_bin) else {
-        return false;
-    };
-    let path = url_path.split('?').next().unwrap_or(url_path);
-    let want = ext.trim_start_matches('.').to_ascii_lowercase();
-    Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case(&want))
-        .unwrap_or(false)
+    rule.cgi_for(url_path).is_some()
 }
 
 pub fn handle(
@@ -44,9 +35,10 @@ pub fn handle(
     listen: SocketAddr,
     head_only: bool,
 ) -> Outbound {
-    let Some(interpreter) = rule.cgi_bin.as_ref() else {
+    let Some(prog) = rule.cgi_for(url_path) else {
         return site_error(site, Status::INTERNAL);
     };
+    let interpreter = &prog.bin;
 
     let script = match resolve(rule, url_path) {
         Ok(p) => p,
@@ -484,10 +476,18 @@ mod tests {
 
     #[test]
     fn extension_match_is_case_insensitive() {
+        use crate::settings::CgiProg;
         let mut rule = PathRule::new("/cgi-bin".into());
-        rule.cgi_ext = Some(".py".into());
-        rule.cgi_bin = Some(PathBuf::from("/usr/bin/python3"));
+        rule.cgi.push(CgiProg {
+            ext: ".py".into(),
+            bin: PathBuf::from("/usr/bin/python3"),
+        });
+        rule.cgi.push(CgiProg {
+            ext: ".sh".into(),
+            bin: PathBuf::from("/bin/bash"),
+        });
         assert!(matches_route(&rule, "/cgi-bin/Hi.PY"));
+        assert!(matches_route(&rule, "/cgi-bin/run.SH"));
         assert!(!matches_route(&rule, "/cgi-bin/hi.txt"));
     }
 
@@ -538,8 +538,10 @@ mod tests {
         let mut rule = PathRule::new("/".into());
         rule.methods = vec![HttpMethod::Get, HttpMethod::Post];
         rule.root = Some(dir.clone());
-        rule.cgi_ext = Some(".py".into());
-        rule.cgi_bin = Some(PathBuf::from("/usr/bin/python3"));
+        rule.cgi.push(crate::settings::CgiProg {
+            ext: ".py".into(),
+            bin: PathBuf::from("/usr/bin/python3"),
+        });
 
         let mut headers = HashMap::new();
         headers.insert("content-type".into(), "text/plain".into());

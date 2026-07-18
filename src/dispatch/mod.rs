@@ -187,9 +187,16 @@ mod tests {
         let mut rule = PathRule::new("/cgi-bin".into());
         rule.methods = vec![HttpMethod::Get, HttpMethod::Post];
         rule.root = Some(PathBuf::from("www/cgi"));
-        rule.cgi_ext = Some(".py".into());
-        rule.cgi_bin = Some(PathBuf::from("/usr/bin/python3"));
+        rule.cgi.push(crate::settings::CgiProg {
+            ext: ".py".into(),
+            bin: PathBuf::from("/usr/bin/python3"),
+        });
+        rule.cgi.push(crate::settings::CgiProg {
+            ext: ".sh".into(),
+            bin: PathBuf::from("/bin/bash"),
+        });
         assert!(cgi_matches(&rule, "/cgi-bin/hello.py"));
+        assert!(cgi_matches(&rule, "/cgi-bin/hello.sh"));
         assert!(!cgi_matches(&rule, "/cgi-bin/readme.txt"));
 
         if !PathBuf::from("www/cgi/hello.py").is_file()

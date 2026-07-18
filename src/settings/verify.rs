@@ -113,11 +113,31 @@ fn check_path(label: &str, path: &PathRule) -> Result<(), String> {
             path.prefix
         ));
     }
-    if path.cgi_ext.is_some() != path.cgi_bin.is_some() {
-        return Err(format!(
-            "{label}: path '{}' cgi requires both extension and interpreter",
-            path.prefix
-        ));
+    if path.cgi.is_empty() {
+        // ok — CGI optional
+    } else {
+        let mut seen = HashSet::new();
+        for prog in &path.cgi {
+            if prog.ext.trim_start_matches('.').is_empty() {
+                return Err(format!(
+                    "{label}: path '{}' has an empty cgi extension",
+                    path.prefix
+                ));
+            }
+            if prog.bin.as_os_str().is_empty() {
+                return Err(format!(
+                    "{label}: path '{}' cgi interpreter path is empty",
+                    path.prefix
+                ));
+            }
+            let key = prog.ext.to_ascii_lowercase();
+            if !seen.insert(key) {
+                return Err(format!(
+                    "{label}: path '{}' lists cgi extension '{}' more than once",
+                    path.prefix, prog.ext
+                ));
+            }
+        }
     }
     Ok(())
 }

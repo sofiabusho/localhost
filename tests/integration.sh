@@ -200,6 +200,14 @@ if [[ -x /usr/bin/python3 ]]; then
   check_contains "CGI QUERY" "$BODY" "QUERY_STRING=q=1"
   BODY=$(curl -s -X POST -H "Content-Type: text/plain" --data "hi" "$HOST/cgi-bin/hello.py")
   check_contains "CGI POST body" "$BODY" "BODY=hi"
+  if [[ -x /bin/bash ]]; then
+    STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$HOST/cgi-bin/hello.sh")
+    check "GET shell CGI → 200" "200" "$STATUS"
+    BODY=$(curl -s "$HOST/cgi-bin/hello.sh?x=2")
+    check_contains "shell CGI QUERY" "$BODY" "QUERY_STRING=x=2"
+  else
+    echo "  SKIP  /bin/bash not available"
+  fi
 else
   echo "  SKIP  python3 not available"
 fi

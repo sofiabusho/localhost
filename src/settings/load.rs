@@ -2,7 +2,7 @@
 //! Brace-oriented configuration parser (custom directive names).
 
 use super::schema::{
-    BodyLimit, HttpMethod, PathRule, RedirectRule, SiteBlock, SiteBundle,
+    BodyLimit, CgiProg, HttpMethod, PathRule, RedirectRule, SiteBlock, SiteBundle,
 };
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -290,8 +290,10 @@ fn parse_path(tokens: &[Tok], cur: &mut usize, prefix: String) -> Result<PathRul
                         } else {
                             format!(".{ext}")
                         };
-                        rule.cgi_ext = Some(ext);
-                        rule.cgi_bin = Some(PathBuf::from(bin));
+                        rule.cgi.push(CgiProg {
+                            ext,
+                            bin: PathBuf::from(bin),
+                        });
                     }
                     "upload" => {
                         rule.upload_dir = Some(PathBuf::from(take_word(tokens, cur)?));
