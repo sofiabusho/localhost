@@ -9,16 +9,18 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
+use std::sync::Arc;
 use std::time::Instant;
 
 const WAIT_SLICE_MS: i32 = 250;
 
 /// Run until interrupted.
-pub fn run(bundle: &SiteBundle) -> Result<(), String> {
+pub fn run(bundle: SiteBundle) -> Result<(), String> {
     let mut addrs = Vec::new();
     for site in &bundle.sites {
         addrs.extend(site.binds.iter().copied());
     }
+    let bundle = Arc::new(bundle);
 
     let listeners = crate::ingress::open_listeners(&addrs)?;
     let wait = WaitSet::create().map_err(|e| format!("epoll_create1 failed: {e}"))?;
@@ -54,7 +56,7 @@ pub fn run(bundle: &SiteBundle) -> Result<(), String> {
                         &wait,
                         &listeners_by_fd,
                         &mut peers,
-                        bundle,
+                        &bundle,
                         ev.fd,
                         timing,
                     );
@@ -112,7 +114,7 @@ fn accept_drain(
     wait: &WaitSet,
     listeners: &HashMap<RawFd, Listener>,
     peers: &mut HashMap<RawFd, Peer>,
-    bundle: &SiteBundle,
+    bundle: &Arc<SiteBundle>,
     listen_fd: RawFd,
     timing: Timing,
 ) {
@@ -131,7 +133,14 @@ fn accept_drain(
                     drop(client);
                     continue;
                 }
-                let peer = Peer::new(client, peer_addr, listen_addr, timing, max_body);
+                let peer = Peer::new(
+                    client,
+                    peer_addr,
+                    listen_addr,
+                    timing,
+                    max_body,
+                    Arc::clone(bundle),
+                );
                 peers.insert(fd, peer);
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => break,

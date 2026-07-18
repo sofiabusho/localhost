@@ -1,10 +1,13 @@
-#![allow(dead_code)] // listen_addr used from Phase 5
+#![allow(dead_code)]
 //! Per-client buffers, phases, and timeout bookkeeping.
 
+use crate::dispatch;
 use crate::http::{try_parse, DecodeError, Outbound, Status};
+use crate::settings::SiteBundle;
 use std::io::{self, ErrorKind};
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Soft limits for slow / idle clients.
@@ -42,7 +45,7 @@ pub enum PeerOutcome {
     Drop,
 }
 
-const MAX_IN: usize = 1024 * 1024; // hard ceiling on in-flight buffer (body limit is separate)
+const MAX_IN: usize = 1024 * 1024;
 const READ_CHUNK: usize = 8 * 1024;
 const WRITE_CHUNK: usize = 8 * 1024;
 
@@ -58,6 +61,7 @@ pub struct Peer {
     last_io: Instant,
     timing: Timing,
     max_body: u64,
+    sites: Arc<SiteBundle>,
 }
 
 impl Peer {
@@ -67,6 +71,7 @@ impl Peer {
         listen_addr: SocketAddr,
         timing: Timing,
         max_body: u64,
+        sites: Arc<SiteBundle>,
     ) -> Self {
         let now = Instant::now();
         Self {
@@ -81,6 +86,7 @@ impl Peer {
             last_io: now,
             timing,
             max_body,
+            sites,
         }
     }
 
@@ -138,14 +144,8 @@ impl Peer {
                 PeerOutcome::Ok(PeerAction::WantSend)
             }
             Ok((msg, _consumed)) => {
-                // Phase 4: acknowledge a well-formed message (routing in Phase 5).
-                let body = format!(
-                    "OK {} {}\nbody_bytes={}\n",
-                    msg.method,
-                    msg.target,
-                    msg.body.len()
-                );
-                self.reply(Outbound::text(Status::OK, body));
+                let resp = dispatch::answer(self.listen_addr, &msg, &self.sites);
+                self.reply(resp);
                 PeerOutcome::Ok(PeerAction::WantSend)
             }
         }

@@ -4,6 +4,7 @@ mod settings;
 mod multiplex;
 mod ingress;
 mod http;
+mod dispatch;
 mod peer;
 mod hub;
 
@@ -44,7 +45,7 @@ fn main() {
         bundle.sites.len()
     );
 
-    if let Err(e) = hub::run(&bundle) {
+    if let Err(e) = hub::run(bundle) {
         eprintln!("localhost: fatal: {e}");
         process::exit(1);
     }
