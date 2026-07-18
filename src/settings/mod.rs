@@ -73,7 +73,7 @@ site {
     }
 
     #[test]
-    fn rejects_duplicate_ports() {
+    fn rejects_conflicting_addresses_on_same_port() {
         let src = r#"
 site {
     bind 127.0.0.1:9000;
@@ -92,7 +92,7 @@ site {
     }
 
     #[test]
-    fn rejects_duplicate_bind_across_sites() {
+    fn allows_shared_bind_with_distinct_names() {
         let src = r#"
 site {
     bind 127.0.0.1:8080;
@@ -105,8 +105,46 @@ site {
     path / { methods GET; root other; }
 }
 "#;
+        let b = parse_ok(src);
+        assert_eq!(b.sites.len(), 2);
+        assert_eq!(b.sites[0].binds, b.sites[1].binds);
+    }
+
+    #[test]
+    fn rejects_shared_bind_without_names() {
+        let src = r#"
+site {
+    bind 127.0.0.1:8080;
+    path / { methods GET; root www; }
+}
+site {
+    bind 127.0.0.1:8080;
+    name two.local;
+    path / { methods GET; root other; }
+}
+"#;
         let bundle = load::parse_source(src).expect("parse");
-        assert!(verify::validate(&bundle).is_err());
+        let err = verify::validate(&bundle).expect_err("needs names");
+        assert!(err.to_lowercase().contains("name") || err.contains("shared"));
+    }
+
+    #[test]
+    fn rejects_shared_bind_with_duplicate_hostname() {
+        let src = r#"
+site {
+    bind 127.0.0.1:8080;
+    name same.local;
+    path / { methods GET; root www; }
+}
+site {
+    bind 127.0.0.1:8080;
+    name Same.Local;
+    path / { methods GET; root other; }
+}
+"#;
+        let bundle = load::parse_source(src).expect("parse");
+        let err = verify::validate(&bundle).expect_err("dup hostname");
+        assert!(err.to_lowercase().contains("hostname") || err.contains("duplicate"));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Semantic checks on a parsed SiteBundle.
 
 use super::schema::{PathRule, SiteBundle};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 
 pub fn validate(bundle: &SiteBundle) -> Result<(), String> {
@@ -9,30 +9,16 @@ pub fn validate(bundle: &SiteBundle) -> Result<(), String> {
         return Err("no site blocks configured".into());
     }
 
-    // Audit: configuring the same port more than once is a hard error.
-    // Name-based vhosts that share a port are wired in a later phase by
-    // allowing multiple `name` values on one site, or by relaxing this check
-    // when hostnames differ (Phase 10). For Phase 1 we fail duplicate ports.
-    let mut seen_ports: HashSet<u16> = HashSet::new();
-    let mut seen_binds: HashSet<SocketAddr> = HashSet::new();
-
     for (idx, site) in bundle.sites.iter().enumerate() {
         let label = format!("site#{idx}");
         if site.binds.is_empty() {
             return Err(format!("{label}: at least one 'bind' is required"));
         }
 
+        let mut local_binds = HashSet::new();
         for addr in &site.binds {
-            if !seen_binds.insert(*addr) {
-                return Err(format!(
-                    "duplicate bind {addr}: already present in the configuration"
-                ));
-            }
-            if !seen_ports.insert(addr.port()) {
-                return Err(format!(
-                    "duplicate port {}: bind {addr} conflicts with an earlier listen",
-                    addr.port()
-                ));
+            if !local_binds.insert(*addr) {
+                return Err(format!("{label}: duplicate bind {addr} within the same site"));
             }
         }
 
@@ -41,6 +27,68 @@ pub fn validate(bundle: &SiteBundle) -> Result<(), String> {
         }
         for path in &site.paths {
             check_path(&label, path)?;
+        }
+    }
+
+    check_shared_binds(bundle)?;
+    check_port_collisions(bundle)?;
+    Ok(())
+}
+
+/// Same `IP:port` on multiple sites is allowed only as name-based vhosts:
+/// every co-tenant needs distinct non-empty `name` values.
+fn check_shared_binds(bundle: &SiteBundle) -> Result<(), String> {
+    let mut by_bind: HashMap<SocketAddr, Vec<usize>> = HashMap::new();
+    for (idx, site) in bundle.sites.iter().enumerate() {
+        for addr in &site.binds {
+            by_bind.entry(*addr).or_default().push(idx);
+        }
+    }
+
+    for (addr, indices) in by_bind {
+        if indices.len() < 2 {
+            continue;
+        }
+        let mut claimed: HashSet<String> = HashSet::new();
+        for idx in indices {
+            let site = &bundle.sites[idx];
+            if site.hostnames.is_empty() {
+                return Err(format!(
+                    "bind {addr}: shared by multiple sites; site#{idx} needs at least one 'name'"
+                ));
+            }
+            for host in &site.hostnames {
+                let key = host.to_ascii_lowercase();
+                if !claimed.insert(key) {
+                    return Err(format!(
+                        "bind {addr}: duplicate hostname '{host}' across name-based vhosts"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Distinct listen addresses that share a numeric port cannot both bind
+/// (e.g. `0.0.0.0:9000` and `127.0.0.1:9000`).
+fn check_port_collisions(bundle: &SiteBundle) -> Result<(), String> {
+    let mut port_addrs: HashMap<u16, HashSet<SocketAddr>> = HashMap::new();
+    for site in &bundle.sites {
+        for addr in &site.binds {
+            port_addrs.entry(addr.port()).or_default().insert(*addr);
+        }
+    }
+    for (port, addrs) in port_addrs {
+        if addrs.len() > 1 {
+            let list = addrs
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "duplicate port {port}: conflicting listen addresses [{list}]"
+            ));
         }
     }
     Ok(())

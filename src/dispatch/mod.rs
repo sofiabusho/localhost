@@ -17,6 +17,10 @@ pub fn answer(listen: SocketAddr, req: &Inbound, bundle: &SiteBundle) -> Outboun
         return Outbound::error(Status::INTERNAL);
     };
 
+    if req.body.len() as u64 > site.max_body.bytes() {
+        return site_error(site, Status::PAYLOAD_TOO_LARGE);
+    }
+
     let path = path_only(&req.target);
     match match_route(site, &path) {
         None => site_error(site, Status::NOT_FOUND),

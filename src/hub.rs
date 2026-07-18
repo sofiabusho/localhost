@@ -162,12 +162,17 @@ fn accept_drain(
 }
 
 fn max_body_for(bundle: &SiteBundle, addr: SocketAddr) -> u64 {
+    let mut ceiling = 0u64;
     for site in &bundle.sites {
         if site.binds.contains(&addr) {
-            return site.max_body.bytes();
+            ceiling = ceiling.max(site.max_body.bytes());
         }
     }
-    1024 * 1024
+    if ceiling == 0 {
+        1024 * 1024
+    } else {
+        ceiling
+    }
 }
 
 fn drop_peer(wait: &WaitSet, peers: &mut HashMap<RawFd, Peer>, fd: RawFd) {
