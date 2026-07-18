@@ -1,0 +1,17 @@
+[package]
+name = "localhost"
+version = "0.1.0"
+edition = "2021"
+description = "A single-threaded HTTP/1.1 server driven by epoll"
+license = "MIT"
+
+[[bin]]
+name = "localhost"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
