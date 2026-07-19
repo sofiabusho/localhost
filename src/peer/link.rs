@@ -35,10 +35,12 @@ impl Default for Timing {
 enum Phase {
     Recv,
     /// Request fully parsed, waiting on an in-flight CGI job. The hub owns
-    /// the job and will call `finish_cgi` once it has a response; until
-    /// then this peer's epoll interest is `Interest::none()` (see
-    /// `PeerOutcome::StartCgi` and `hub::run`), so `on_readable`/
-    /// `on_writable` are not expected to be called while in this phase.
+    /// the job and will call `finish_cgi` once it has a response. This
+    /// peer's epoll interest stays `Interest::read_only()` (see
+    /// `PeerOutcome::StartCgi` and `hub::run`) so a client giving up early
+    /// is still noticed via `on_readable` — plain `EPOLLERR`/`EPOLLHUP`
+    /// alone does not fire on a peer's ordinary `close()`, only a real
+    /// `recv()` returning 0 does.
     Cgi,
     Send,
 }
@@ -55,8 +57,8 @@ pub enum PeerOutcome {
     Ok(PeerAction),
     Drop,
     /// Route matched a CGI extension. The hub must spawn the job, register
-    /// its pipe fds with the same epoll instance, and switch this peer's
-    /// interest to `Interest::none()` — see `hub::run`.
+    /// its pipe fds with the same epoll instance, and keep this peer's
+    /// interest at `Interest::read_only()` — see `hub::run`.
     StartCgi(CgiHandoff),
 }
 
@@ -140,11 +142,7 @@ impl Peer {
     pub fn on_readable(&mut self) -> PeerOutcome {
         match self.phase {
             Phase::Send => return PeerOutcome::Ok(PeerAction::WantSend),
-            // Waiting on a CGI job; this peer's interest is Interest::none()
-            // while in this phase, so epoll should never actually report it
-            // readable — this arm only guards against that assumption ever
-            // being wrong, without disturbing the in-flight job.
-            Phase::Cgi => return PeerOutcome::Ok(PeerAction::KeepRecv),
+            Phase::Cgi => return self.on_readable_during_cgi(),
             Phase::Recv => {}
         }
 
@@ -169,6 +167,28 @@ impl Peer {
         }
         self.inbuf.extend_from_slice(&tmp[..n]);
         self.try_finish_request()
+    }
+
+    /// At most one `recv` syscall, same discipline as the `Recv`-phase path.
+    /// The request is already fully parsed and handed off to a CGI job, so
+    /// there's nothing left to parse here — this exists only to notice a
+    /// client giving up early. `Ok(0)`/error means the connection is gone;
+    /// the hub drops the peer, which also marks the in-flight job abandoned
+    /// (see `hub::drop_peer`). Anything else read here (a client shouldn't
+    /// normally send more bytes on a one-shot request, but might) is simply
+    /// discarded — there's no request state left to append it to.
+    fn on_readable_during_cgi(&mut self) -> PeerOutcome {
+        let mut tmp = [0u8; READ_CHUNK];
+        match recv_once(self.fd.as_raw_fd(), &mut tmp) {
+            Ok(0) => PeerOutcome::Drop,
+            Ok(_) => {
+                self.last_io = Instant::now();
+                PeerOutcome::Ok(PeerAction::KeepRecv)
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => PeerOutcome::Ok(PeerAction::KeepRecv),
+            Err(e) if e.kind() == ErrorKind::Interrupted => PeerOutcome::Ok(PeerAction::KeepRecv),
+            Err(_) => PeerOutcome::Drop,
+        }
     }
 
     fn try_finish_request(&mut self) -> PeerOutcome {

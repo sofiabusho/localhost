@@ -16,9 +16,13 @@ pub struct Interest {
 
 impl Interest {
     /// Neither readable nor writable — still yields EPOLLERR/EPOLLHUP (see
-    /// `as_events`). Used for a peer that's waiting on an in-flight CGI job:
-    /// nothing to read (the full request is already parsed) or write (no
-    /// response yet), but a client-side abort should still surface.
+    /// `as_events`). Not currently used for CGI-wait peers: plain
+    /// EPOLLERR/EPOLLHUP alone does not fire on an ordinary peer close()
+    /// (confirmed empirically — only EPOLLIN via a recv() returning 0, or
+    /// EPOLLRDHUP, catches that), so a peer waiting on a CGI job stays
+    /// registered `read_only()` instead so it can still notice an abort.
+    /// Kept as a documented, correct primitive for callers that genuinely
+    /// only care about error/hangup conditions.
     pub fn none() -> Self {
         Self {
             read: false,

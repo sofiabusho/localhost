@@ -6,9 +6,9 @@
 //! like a peer fd, and `handle_cgi_stdout`/`handle_cgi_stdin` each do at
 //! most one syscall per wake, same discipline as `Peer::on_readable` /
 //! `on_writable`. A peer that triggers a CGI job moves to `Phase::Cgi` and
-//! has its own epoll interest set to `Interest::none()` (see
-//! `peer::link::Phase`) until the job hands back a response via
-//! `Peer::finish_cgi`.
+//! stays registered `Interest::read_only()` (see `peer::link::Phase`) so a
+//! client giving up early is still noticed, until the job hands back a
+//! response via `Peer::finish_cgi`.
 
 use crate::content::{self, CgiPlan};
 use crate::dispatch;
@@ -48,7 +48,10 @@ struct CgiJob {
     out_buf: Vec<u8>,
     stdout_eof: bool,
     reaped: bool,
-    killed: bool,
+    /// We've decided this job is dead — owner disconnected, or it blew past
+    /// `deadline`. Distinct from `kill_sent` so we send SIGKILL exactly once.
+    abandoned: bool,
+    kill_sent: bool,
     deadline: Instant,
     head_only: bool,
     sites: Arc<SiteBundle>,
@@ -162,7 +165,12 @@ pub fn run(bundle: SiteBundle) -> Result<(), String> {
                 let cookie = handoff.cookie.clone();
                 match start_cgi_job(&wait, &mut jobs, &mut stdin_index, owner, handoff, now) {
                     Ok(()) => {
-                        if let Err(e) = wait.modify(owner, Interest::none(), owner as u64) {
+                        // Stay read_only (not Interest::none()) so a client
+                        // that gives up early is still noticed: plain
+                        // EPOLLERR/EPOLLHUP alone doesn't fire on an
+                        // ordinary close(), only a recv() returning 0 does
+                        // (see Peer::on_readable_during_cgi).
+                        if let Err(e) = wait.modify(owner, Interest::read_only(), owner as u64) {
                             eprintln!("localhost: epoll_ctl MOD peer {owner} (cgi wait): {e}");
                             drop_peer(&wait, &mut peers, &mut jobs, owner);
                         }
@@ -266,13 +274,13 @@ fn drop_peer(
     if peers.remove(&fd).is_some() {
         let _ = wait.remove(fd);
     }
-    // Any CGI job this peer started is now unwanted. Mark it killed and let
-    // the next `reap_cgi` pass do the actual SIGKILL + WNOHANG + fd
+    // Any CGI job this peer started is now unwanted. Mark it abandoned and
+    // let the next `reap_cgi` pass do the actual SIGKILL + WNOHANG + fd
     // teardown — funneling cleanup through one place means we never risk
     // leaving a zombie behind just because its owner disappeared first.
     for job in jobs.values_mut() {
         if job.owner == fd {
-            job.killed = true;
+            job.abandoned = true;
         }
     }
 }
@@ -344,7 +352,8 @@ fn start_cgi_job(
             out_buf: Vec::new(),
             stdout_eof: false,
             reaped: false,
-            killed: false,
+            abandoned: false,
+            kill_sent: false,
             deadline: now + content::CGI_TIMEOUT,
             head_only,
             sites,
@@ -455,12 +464,16 @@ fn reap_cgi(
     let mut finished: Vec<RawFd> = Vec::new();
 
     for (job_id, job) in jobs.iter_mut() {
-        if !job.killed && now >= job.deadline {
+        if !job.abandoned && now >= job.deadline {
             eprintln!("localhost: cgi pid {} timed out, killing", job.pid);
+            job.abandoned = true;
+        }
+
+        if job.abandoned && !job.kill_sent {
             unsafe {
                 libc::kill(job.pid, libc::SIGKILL);
             }
-            job.killed = true;
+            job.kill_sent = true;
         }
 
         if !job.reaped {
@@ -476,7 +489,7 @@ fn reap_cgi(
             }
         }
 
-        if job.reaped && (job.killed || job.stdout_eof) {
+        if job.reaped && (job.kill_sent || job.stdout_eof) {
             finished.push(*job_id);
         }
     }
@@ -492,7 +505,7 @@ fn reap_cgi(
         }
         let _ = wait.remove(job_id); // job_id is stdout_fd's raw value
 
-        let resp = if job.killed {
+        let resp = if job.kill_sent {
             match dispatch::select_site(&job.sites, job.listen, job.host.as_deref()) {
                 Some(site) => content::site_error(site, Status::GATEWAY_TIMEOUT),
                 None => Outbound::error(Status::GATEWAY_TIMEOUT),

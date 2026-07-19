@@ -338,6 +338,54 @@ else
   echo "  SKIP  python3 not available"
 fi
 
+# ── Client disconnect during CGI still reaps the child ──────
+echo ""
+echo "[15] Client disconnect mid-CGI reaps the child (no orphaned process)"
+if [[ -x /usr/bin/python3 ]]; then
+  FD_BEFORE=$(ls "/proc/$PID/fd" 2>/dev/null | wc -l)
+
+  # Open a raw connection, send a request to the slow CGI script, then close
+  # immediately without reading any response. The server still forks and
+  # runs slow.py (the request bytes are already fully sent), but nobody is
+  # left to deliver a response to — this is exactly the path where
+  # drop_peer marks the job unwanted.
+  python3 - <<'PY'
+import socket
+req = b"GET /cgi-bin/slow.py HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+s = socket.create_connection(("127.0.0.1", 18080), 2)
+s.sendall(req)
+s.close()
+PY
+
+  REAPED=0
+  for _ in $(seq 1 20); do
+    sleep 0.05
+    if ! pgrep -f "slow\.py" >/dev/null 2>&1; then
+      REAPED=1
+      break
+    fi
+  done
+  if [[ "$REAPED" == "1" ]]; then
+    echo "  PASS  slow.py process reaped after client disconnect"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL  slow.py process reaped after client disconnect (still running after ~1s)"
+    FAIL=$((FAIL + 1))
+  fi
+
+  sleep 0.2 # let the hub finish tearing down the job's fds after the kill
+  FD_AFTER=$(ls "/proc/$PID/fd" 2>/dev/null | wc -l)
+  if [[ "$FD_AFTER" -le "$FD_BEFORE" ]]; then
+    echo "  PASS  server fd count back down ($FD_BEFORE -> $FD_AFTER)"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL  server fd count back down ($FD_BEFORE -> $FD_AFTER, expected <= $FD_BEFORE)"
+    FAIL=$((FAIL + 1))
+  fi
+else
+  echo "  SKIP  python3 not available"
+fi
+
 # ── Summary ───────────────────────────────────────────────
 TOTAL=$((PASS + FAIL))
 echo ""
