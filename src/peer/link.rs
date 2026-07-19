@@ -50,9 +50,12 @@ pub enum PeerOutcome {
     Drop,
 }
 
-const MAX_IN: usize = 1024 * 1024;
 const READ_CHUNK: usize = 8 * 1024;
 const WRITE_CHUNK: usize = 8 * 1024;
+// Room for the request line + headers on top of the site's configured body limit.
+// try_parse() applies the authoritative Content-Length/chunked check against
+// max_body; this only bounds how much we let a client buffer before that.
+const HEAD_SLACK: u64 = 64 * 1024;
 
 pub struct Peer {
     fd: OwnedFd,
@@ -132,7 +135,8 @@ impl Peer {
         };
 
         self.last_io = Instant::now();
-        if self.inbuf.len() + n > MAX_IN {
+        let ceiling = self.max_body.saturating_add(HEAD_SLACK);
+        if (self.inbuf.len() + n) as u64 > ceiling {
             self.reply(self.parse_error(Status::PAYLOAD_TOO_LARGE));
             return PeerOutcome::Ok(PeerAction::WantSend);
         }

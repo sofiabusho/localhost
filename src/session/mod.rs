@@ -46,8 +46,11 @@ impl Vault {
     }
 
     /// Resume a cookie session or mint a fresh id. Touches activity time.
+    /// Expiry is swept by the caller on its own cadence (see `sweep`), not
+    /// here — an O(n) scan on every single request degrades badly once the
+    /// table has many entries (e.g. under sustained load from clients that
+    /// don't return a cookie, such as `siege -b`).
     pub fn resume_or_mint(&mut self, cookie_header: Option<&str>) -> String {
-        self.sweep();
         if let Some(id) = cookie_header.and_then(read_session_id) {
             if let Some(slot) = self.slots.get_mut(id) {
                 if slot.touched.elapsed() < IDLE_LIMIT {
