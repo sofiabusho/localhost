@@ -15,6 +15,17 @@ pub struct Interest {
 }
 
 impl Interest {
+    /// Neither readable nor writable — still yields EPOLLERR/EPOLLHUP (see
+    /// `as_events`). Used for a peer that's waiting on an in-flight CGI job:
+    /// nothing to read (the full request is already parsed) or write (no
+    /// response yet), but a client-side abort should still surface.
+    pub fn none() -> Self {
+        Self {
+            read: false,
+            write: false,
+        }
+    }
+
     pub fn read_only() -> Self {
         Self {
             read: true,

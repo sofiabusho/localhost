@@ -294,6 +294,50 @@ else
 fi
 rm -f "$BAD2"
 
+# ── Concurrent CGI does not block the event loop ─────────
+echo ""
+echo "[14] Concurrent CGI vs. static file (proves CGI doesn't stall the loop)"
+if [[ -x /usr/bin/python3 ]]; then
+  SLOW_BODY="$ROOT/tests/tmp/slow_cgi_body.txt"
+  SLOW_STATUS_FILE="$ROOT/tests/tmp/slow_cgi_status.txt"
+  rm -f "$SLOW_BODY" "$SLOW_STATUS_FILE"
+
+  # www/cgi/slow.py sleeps ~2.5s before responding. Fire it in the
+  # background, then — while it's still running — fire a plain static
+  # request and time it. If CGI were still blocking the single epoll loop
+  # (the old behavior), the static request would queue up behind the sleep
+  # and take ~2.5s too; with CGI running through epoll via pipe fds, it
+  # should come back in well under a second.
+  (
+    STATUS=$(curl -s -o "$SLOW_BODY" -w "%{http_code}" --max-time 10 "$HOST/cgi-bin/slow.py")
+    echo -n "$STATUS" > "$SLOW_STATUS_FILE"
+  ) &
+  SLOW_PID=$!
+  sleep 0.3 # let the slow request be accepted and its CGI child start
+
+  T0=$(date +%s.%N)
+  STATIC_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "$HOST/")
+  T1=$(date +%s.%N)
+  ELAPSED=$(echo "$T1 - $T0" | bc)
+
+  check "static request succeeds while CGI in flight" "200" "$STATIC_STATUS"
+  NOT_BLOCKED=$(echo "$ELAPSED < 1.5" | bc)
+  if [[ "$NOT_BLOCKED" == "1" ]]; then
+    echo "  PASS  static request not blocked by slow CGI (${ELAPSED}s)"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL  static request not blocked by slow CGI (took ${ELAPSED}s, expected < 1.5s)"
+    FAIL=$((FAIL + 1))
+  fi
+
+  wait "$SLOW_PID"
+  SLOW_STATUS=$(cat "$SLOW_STATUS_FILE" 2>/dev/null || echo "000")
+  check "slow CGI still completes on its own → 200" "200" "$SLOW_STATUS"
+  check_contains "slow CGI body correct" "$(cat "$SLOW_BODY" 2>/dev/null)" "slow-done"
+else
+  echo "  SKIP  python3 not available"
+fi
+
 # ── Summary ───────────────────────────────────────────────
 TOTAL=$((PASS + FAIL))
 echo ""

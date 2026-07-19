@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 //! Per-client buffers, phases, and timeout bookkeeping.
 
-use crate::content::site_error;
+use crate::content::{site_error, CgiPlan};
 use crate::dispatch;
 use crate::dispatch::select_site;
 use crate::http::{try_parse, DecodeError, Outbound, Status};
@@ -34,6 +34,12 @@ impl Default for Timing {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Recv,
+    /// Request fully parsed, waiting on an in-flight CGI job. The hub owns
+    /// the job and will call `finish_cgi` once it has a response; until
+    /// then this peer's epoll interest is `Interest::none()` (see
+    /// `PeerOutcome::StartCgi` and `hub::run`), so `on_readable`/
+    /// `on_writable` are not expected to be called while in this phase.
+    Cgi,
     Send,
 }
 
@@ -44,10 +50,25 @@ pub enum PeerAction {
     Close,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum PeerOutcome {
     Ok(PeerAction),
     Drop,
+    /// Route matched a CGI extension. The hub must spawn the job, register
+    /// its pipe fds with the same epoll instance, and switch this peer's
+    /// interest to `Interest::none()` — see `hub::run`.
+    StartCgi(CgiHandoff),
+}
+
+/// Everything the hub needs to spawn a CGI job and, later, deliver its
+/// response back to the peer that asked for it.
+#[derive(Debug)]
+pub struct CgiHandoff {
+    pub plan: CgiPlan,
+    pub sites: Arc<SiteBundle>,
+    pub listen: SocketAddr,
+    pub host: Option<String>,
+    pub cookie: Option<String>,
 }
 
 const READ_CHUNK: usize = 8 * 1024;
@@ -117,8 +138,14 @@ impl Peer {
 
     /// At most one `recv` syscall. Call only when epoll reported readable.
     pub fn on_readable(&mut self) -> PeerOutcome {
-        if self.phase != Phase::Recv {
-            return PeerOutcome::Ok(PeerAction::WantSend);
+        match self.phase {
+            Phase::Send => return PeerOutcome::Ok(PeerAction::WantSend),
+            // Waiting on a CGI job; this peer's interest is Interest::none()
+            // while in this phase, so epoll should never actually report it
+            // readable — this arm only guards against that assumption ever
+            // being wrong, without disturbing the in-flight job.
+            Phase::Cgi => return PeerOutcome::Ok(PeerAction::KeepRecv),
+            Phase::Recv => {}
         }
 
         let mut tmp = [0u8; READ_CHUNK];
@@ -155,13 +182,37 @@ impl Peer {
                 self.reply(self.parse_error(Status::PAYLOAD_TOO_LARGE));
                 PeerOutcome::Ok(PeerAction::WantSend)
             }
-            Ok((msg, _consumed)) => {
-                let mut resp = dispatch::answer(self.listen_addr, &msg, &self.sites);
-                resp = self.stamp_session(msg.header("cookie"), resp);
-                self.reply(resp);
-                PeerOutcome::Ok(PeerAction::WantSend)
-            }
+            Ok((msg, _consumed)) => match dispatch::answer(self.listen_addr, &msg, &self.sites) {
+                dispatch::Answer::Done(mut resp) => {
+                    resp = self.stamp_session(msg.header("cookie"), resp);
+                    self.reply(resp);
+                    PeerOutcome::Ok(PeerAction::WantSend)
+                }
+                dispatch::Answer::Cgi(plan) => {
+                    let handoff = CgiHandoff {
+                        plan,
+                        sites: Arc::clone(&self.sites),
+                        listen: self.listen_addr,
+                        host: msg.header("host").map(str::to_string),
+                        cookie: msg.header("cookie").map(str::to_string),
+                    };
+                    // The hub owns everything from here: spawning, epoll
+                    // registration for the pipe fds, and eventually calling
+                    // `finish_cgi` below once it has a response.
+                    self.phase = Phase::Cgi;
+                    self.inbuf.clear();
+                    PeerOutcome::StartCgi(handoff)
+                }
+            },
         }
+    }
+
+    /// Called by the hub once an in-flight CGI job has a response (either
+    /// real output or a timeout/error substitute). Applies the same session
+    /// stamping every other response gets and queues it for sending.
+    pub fn finish_cgi(&mut self, cookie: Option<&str>, resp: Outbound) {
+        let resp = self.stamp_session(cookie, resp);
+        self.reply(resp);
     }
 
     fn stamp_session(&self, cookie_header: Option<&str>, mut resp: Outbound) -> Outbound {
@@ -205,8 +256,10 @@ impl Peer {
 
     /// At most one `send` syscall. Call only when epoll reported writable.
     pub fn on_writable(&mut self) -> PeerOutcome {
-        if self.phase != Phase::Send {
-            return PeerOutcome::Ok(PeerAction::KeepRecv);
+        match self.phase {
+            Phase::Recv => return PeerOutcome::Ok(PeerAction::KeepRecv),
+            Phase::Cgi => return PeerOutcome::Ok(PeerAction::KeepRecv),
+            Phase::Send => {}
         }
 
         let remaining = &self.outbuf[self.out_off..];

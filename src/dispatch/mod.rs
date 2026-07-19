@@ -6,24 +6,34 @@ mod route;
 pub use route::{match_route, path_only};
 pub use vhost::select_site;
 
-use crate::content::{cgi_matches, handle_cgi, handle_delete, handle_post, serve_get, site_error};
+use crate::content::{
+    cgi_matches, handle_delete, handle_post, plan_cgi, serve_get, site_error, CgiPlan,
+};
 use crate::http::{Inbound, Outbound, Status};
 use crate::settings::{HttpMethod, SiteBundle};
 use std::net::SocketAddr;
 
-/// Resolve Host + URI against the config and build a response.
-pub fn answer(listen: SocketAddr, req: &Inbound, bundle: &SiteBundle) -> Outbound {
+/// Result of routing a request: either a response is ready, or a CGI job
+/// needs to be spawned and driven through epoll before one exists.
+pub enum Answer {
+    Done(Outbound),
+    Cgi(CgiPlan),
+}
+
+/// Resolve Host + URI against the config and decide what to do about it.
+/// Does not run CGI — see `content::cgi` and `hub::run` for why.
+pub fn answer(listen: SocketAddr, req: &Inbound, bundle: &SiteBundle) -> Answer {
     let Some(site) = select_site(bundle, listen, req.header("host")) else {
-        return Outbound::error(Status::INTERNAL);
+        return Answer::Done(Outbound::error(Status::INTERNAL));
     };
 
     if req.body.len() as u64 > site.max_body.bytes() {
-        return site_error(site, Status::PAYLOAD_TOO_LARGE);
+        return Answer::Done(site_error(site, Status::PAYLOAD_TOO_LARGE));
     }
 
     let path = path_only(&req.target);
     match match_route(site, &path) {
-        None => site_error(site, Status::NOT_FOUND),
+        None => Answer::Done(site_error(site, Status::NOT_FOUND)),
         Some(rule) => {
             let method = HttpMethod::parse(&req.method);
             if !rule.methods.iter().any(|m| *m == method) {
@@ -33,27 +43,34 @@ pub fn answer(listen: SocketAddr, req: &Inbound, bundle: &SiteBundle) -> Outboun
                     .map(|m| m.as_str())
                     .collect::<Vec<_>>()
                     .join(", ");
-                return site_error(site, Status::METHOD_NOT_ALLOWED).header("Allow", allow);
+                return Answer::Done(
+                    site_error(site, Status::METHOD_NOT_ALLOWED).header("Allow", allow),
+                );
             }
 
             if let Some(redir) = &rule.redirect {
-                return Outbound::new(redir.status)
-                    .header("Location", redir.target.clone())
-                    .header("Content-Length", "0");
+                return Answer::Done(
+                    Outbound::new(redir.status)
+                        .header("Location", redir.target.clone())
+                        .header("Content-Length", "0"),
+                );
             }
 
             if cgi_matches(rule, &path) {
                 let head_only = matches!(method, HttpMethod::Head);
-                return handle_cgi(site, rule, req, &path, listen, head_only);
+                return match plan_cgi(site, rule, req, &path, listen, head_only) {
+                    Ok(plan) => Answer::Cgi(plan),
+                    Err(resp) => Answer::Done(resp),
+                };
             }
 
-            match method {
+            Answer::Done(match method {
                 HttpMethod::Get => serve_get(site, rule, &path, false),
                 HttpMethod::Head => serve_get(site, rule, &path, true),
                 HttpMethod::Post => handle_post(site, rule, req),
                 HttpMethod::Delete => handle_delete(site, rule, &path),
                 _ => site_error(site, Status::METHOD_NOT_ALLOWED),
-            }
+            })
         }
     }
 }
@@ -117,6 +134,13 @@ mod tests {
         }
     }
 
+    fn expect_done(a: Answer) -> Outbound {
+        match a {
+            Answer::Done(resp) => resp,
+            Answer::Cgi(_) => panic!("expected a resolved response, got a CGI handoff"),
+        }
+    }
+
     #[test]
     fn host_selects_named_site() {
         let b = bundle();
@@ -144,7 +168,7 @@ mod tests {
     fn method_not_allowed() {
         let b = bundle();
         let listen: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        let out = answer(listen, &req("DELETE", "/", "alpha.local"), &b);
+        let out = expect_done(answer(listen, &req("DELETE", "/", "alpha.local"), &b));
         assert_eq!(out.status, 405);
         assert!(out
             .headers
@@ -156,7 +180,7 @@ mod tests {
     fn redirect_sets_location() {
         let b = bundle();
         let listen: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        let out = answer(listen, &req("GET", "/old", "alpha.local"), &b);
+        let out = expect_done(answer(listen, &req("GET", "/old", "alpha.local"), &b));
         assert_eq!(out.status, 301);
         assert!(out
             .headers
@@ -210,10 +234,17 @@ mod tests {
         site.paths = vec![rule];
         let bundle = SiteBundle { sites: vec![site] };
         let listen: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        let out = answer(listen, &req("GET", "/cgi-bin/hello.py", "localhost"), &bundle);
-        assert_eq!(out.status, 200);
-        let body = String::from_utf8_lossy(&out.body);
-        assert!(body.contains("REQUEST_METHOD=GET"));
+        // Routing decides this needs CGI and hands back a plan instead of
+        // running it inline — the full spawn+drain round trip (env vars,
+        // body passthrough) is covered by `content::cgi`'s own tests and by
+        // `tests/integration.sh`, which exercise the real epoll-driven path.
+        match answer(listen, &req("GET", "/cgi-bin/hello.py", "localhost"), &bundle) {
+            Answer::Cgi(plan) => {
+                assert_eq!(plan.interpreter, PathBuf::from("/usr/bin/python3"));
+                assert!(plan.script.ends_with("hello.py"));
+            }
+            Answer::Done(resp) => panic!("expected a CGI handoff, got status {}", resp.status),
+        }
     }
 
     #[test]
@@ -224,7 +255,7 @@ mod tests {
         if !PathBuf::from("www/index.html").is_file() {
             return;
         }
-        let out = answer(listen, &req("GET", "/", "alpha.local"), &b);
+        let out = expect_done(answer(listen, &req("GET", "/", "alpha.local"), &b));
         assert_eq!(out.status, 200);
         assert!(out
             .headers

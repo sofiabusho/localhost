@@ -2,4 +2,4 @@
 
 mod link;
 
-pub use link::{Peer, PeerAction, PeerOutcome, Timing};
+pub use link::{CgiHandoff, Peer, PeerAction, PeerOutcome, Timing};

@@ -1,8 +1,17 @@
-//! Run one configured CGI interpreter for a matching script extension.
+//! Run a configured CGI interpreter for a matching script extension.
 //!
-//! Child process: `execve(interpreter, [interpreter, script], env)`.
-//! Request body is written to stdin and closed (EOF). Parent reads stdout
-//! until the child exits or a hard timeout fires.
+//! CGI execution is split so the hub drives all of it through the single
+//! epoll instance instead of blocking the event loop on `poll()`/`waitpid()`:
+//!   - `plan()`  resolves the script and builds the CGI environment. Pure
+//!     local filesystem work (stat/canonicalize), no process or socket I/O,
+//!     so it stays synchronous — same as `content::serve`'s file lookups.
+//!   - `spawn()` forks + execs the interpreter and hands back non-blocking
+//!     pipe fds. It does not write the body or read any output; the hub
+//!     registers those fds on its own epoll instance (`src/hub.rs`) and
+//!     feeds/drains them exactly like a client socket — one read or write
+//!     per fd per wake.
+//!   - `finish()` turns the bytes the hub collected into a response once
+//!     it has observed EOF on the stdout pipe (or is giving up on a kill).
 
 use super::errpage::site_error;
 use super::map::resolve;
@@ -10,76 +19,78 @@ use crate::http::{Inbound, Outbound, Status};
 use crate::settings::{PathRule, SiteBlock};
 use libc::{self, c_char, c_int, pid_t};
 use std::ffi::CString;
-use std::io;
 use std::net::SocketAddr;
-use std::os::fd::RawFd;
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::path::{Path, PathBuf};
 use std::ptr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-const CGI_TIMEOUT: Duration = Duration::from_secs(5);
-const READ_CHUNK: usize = 8 * 1024;
+/// Hard ceiling on how long a CGI job (spawn to final byte) may run. Enforced
+/// by the hub on the same per-tick cadence it already uses for client
+/// idle/request timeouts (see `Peer::timed_out` / `hub::reap_cgi`).
+pub const CGI_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// True when this route has a CGI mapping for the request path extension.
 pub fn matches_route(rule: &PathRule, url_path: &str) -> bool {
     rule.cgi_for(url_path).is_some()
 }
 
-pub fn handle(
+/// Everything needed to fork + exec, fully owned so it can outlive the
+/// single request-handling call and sit in the hub's job table across many
+/// epoll wakes.
+#[derive(Debug)]
+pub struct CgiPlan {
+    pub interpreter: PathBuf,
+    pub script: PathBuf,
+    pub env: Vec<String>,
+    pub body: Vec<u8>,
+    pub head_only: bool,
+}
+
+/// Resolve the script and build the environment. No process/socket I/O.
+pub fn plan(
     site: &SiteBlock,
     rule: &PathRule,
     req: &Inbound,
     url_path: &str,
     listen: SocketAddr,
     head_only: bool,
-) -> Outbound {
+) -> Result<CgiPlan, Outbound> {
     let Some(prog) = rule.cgi_for(url_path) else {
-        return site_error(site, Status::INTERNAL);
+        return Err(site_error(site, Status::INTERNAL));
     };
-    let interpreter = &prog.bin;
+    let interpreter = prog.bin.clone();
 
     let script = match resolve(rule, url_path) {
         Ok(p) => p,
-        Err(e) => return site_error(site, e.status()),
+        Err(e) => return Err(site_error(site, e.status())),
     };
-
     if !script.is_file() {
-        return site_error(site, Status::NOT_FOUND);
+        return Err(site_error(site, Status::NOT_FOUND));
     }
 
-    match spawn_and_collect(interpreter, &script, site, req, url_path, listen) {
-        Ok(mut resp) => {
-            if head_only {
-                let len = resp.body.len();
-                resp.body.clear();
-                resp.headers
-                    .retain(|(k, _)| !k.eq_ignore_ascii_case("content-length"));
-                resp.headers
-                    .push(("Content-Length".into(), len.to_string()));
-            }
-            resp
-        }
-        Err(CgiFail::Timeout) => site_error(site, Status::GATEWAY_TIMEOUT),
-        Err(CgiFail::Io) => site_error(site, Status::INTERNAL),
-    }
+    let env = build_env(&script, site, req, url_path, listen);
+    Ok(CgiPlan {
+        interpreter,
+        script,
+        env,
+        body: req.body.clone(),
+        head_only,
+    })
 }
 
-#[derive(Debug)]
-enum CgiFail {
-    Timeout,
-    Io,
+/// A forked, exec'd CGI child. Both pipe fds are non-blocking; the caller
+/// (the hub) owns registering them with epoll and driving every read/write.
+pub struct SpawnedCgi {
+    pub pid: pid_t,
+    /// `None` when the request had no body — stdin was closed immediately
+    /// so the child sees EOF without the hub needing to register anything.
+    pub stdin: Option<OwnedFd>,
+    pub stdout: OwnedFd,
 }
 
-fn spawn_and_collect(
-    interpreter: &Path,
-    script: &Path,
-    site: &SiteBlock,
-    req: &Inbound,
-    url_path: &str,
-    listen: SocketAddr,
-) -> Result<Outbound, CgiFail> {
+/// Fork + exec. Never writes the body or reads output — see module docs.
+pub fn spawn(plan: &CgiPlan) -> Result<SpawnedCgi, ()> {
     let (in_r, in_w) = make_pipe()?;
     let (out_r, out_w) = make_pipe()?;
 
@@ -89,11 +100,11 @@ fn spawn_and_collect(
         close_fd(in_w);
         close_fd(out_r);
         close_fd(out_w);
-        return Err(CgiFail::Io);
+        return Err(());
     }
 
     if pid == 0 {
-        // Child — never return to Rust.
+        // Child — never returns to Rust.
         unsafe {
             libc::close(in_w);
             libc::close(out_r);
@@ -105,47 +116,58 @@ fn spawn_and_collect(
             libc::close(in_r);
             libc::close(out_w);
         }
-        enter_child(interpreter, script, site, req, url_path, listen);
+        enter_child(plan);
     }
 
-    // Parent
+    // Parent.
     close_fd(in_r);
     close_fd(out_w);
 
-    let feed = feed_stdin(in_w, &req.body);
-    close_fd(in_w);
-    if feed.is_err() {
-        kill_wait(pid);
+    if set_nonblock(out_r).is_err() {
+        close_fd(in_w);
         close_fd(out_r);
-        return Err(CgiFail::Io);
+        // Fork already happened; the child is orphaned from our point of
+        // view. This branch requires fcntl() to fail on an fd we just
+        // created, which in practice only happens under fd-table exhaustion
+        // racing the fork — rare enough, and early enough in the child's
+        // life, that a bounded blocking reap here doesn't compromise the
+        // "no blocking I/O in the hot path" rule (the hot path is request
+        // handling, not this one-in-a-million startup failure).
+        kill_and_forget(pid);
+        return Err(());
     }
+    let stdout = unsafe { OwnedFd::from_raw_fd(out_r) };
 
-    let output = match drain_stdout(out_r, pid) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            close_fd(out_r);
-            kill_wait(pid);
-            return Err(e);
-        }
+    let stdin = if plan.body.is_empty() {
+        close_fd(in_w); // signal EOF immediately, nothing to send
+        None
+    } else if set_nonblock(in_w).is_ok() {
+        Some(unsafe { OwnedFd::from_raw_fd(in_w) })
+    } else {
+        close_fd(in_w);
+        None
     };
-    close_fd(out_r);
 
-    if let Err(e) = reap(pid) {
-        return Err(e);
-    }
-
-    Ok(parse_cgi_stdout(&output))
+    Ok(SpawnedCgi { pid, stdin, stdout })
 }
 
-fn enter_child(
-    interpreter: &Path,
-    script: &Path,
-    site: &SiteBlock,
-    req: &Inbound,
-    url_path: &str,
-    listen: SocketAddr,
-) -> ! {
-    if let Some(dir) = script.parent() {
+/// Turn collected stdout bytes into a response once the hub has observed
+/// EOF on the pipe.
+pub fn finish(out_buf: &[u8], head_only: bool) -> Outbound {
+    let mut resp = parse_cgi_stdout(out_buf);
+    if head_only {
+        let len = resp.body.len();
+        resp.body.clear();
+        resp.headers
+            .retain(|(k, _)| !k.eq_ignore_ascii_case("content-length"));
+        resp.headers
+            .push(("Content-Length".into(), len.to_string()));
+    }
+    resp
+}
+
+fn enter_child(plan: &CgiPlan) -> ! {
+    if let Some(dir) = plan.script.parent() {
         if let Ok(c) = path_c(dir) {
             unsafe {
                 let _ = libc::chdir(c.as_ptr());
@@ -153,19 +175,19 @@ fn enter_child(
         }
     }
 
-    let env = build_env(interpreter, script, site, req, url_path, listen);
-    let env_c: Vec<CString> = env
-        .into_iter()
-        .filter_map(|s| CString::new(s).ok())
+    let env_c: Vec<CString> = plan
+        .env
+        .iter()
+        .filter_map(|s| CString::new(s.as_str()).ok())
         .collect();
     let mut envp: Vec<*const c_char> = env_c.iter().map(|s| s.as_ptr()).collect();
     envp.push(ptr::null());
 
-    let interp_c = match path_c(interpreter) {
+    let interp_c = match path_c(&plan.interpreter) {
         Ok(c) => c,
         Err(_) => unsafe { libc::_exit(127) },
     };
-    let script_c = match path_c(script) {
+    let script_c = match path_c(&plan.script) {
         Ok(c) => c,
         Err(_) => unsafe { libc::_exit(127) },
     };
@@ -178,7 +200,6 @@ fn enter_child(
 }
 
 fn build_env(
-    _interpreter: &Path,
     script: &Path,
     site: &SiteBlock,
     req: &Inbound,
@@ -200,11 +221,9 @@ fn build_env(
     let script_abs = script
         .canonicalize()
         .unwrap_or_else(|_| script.to_path_buf());
-    // Spec: CGI uses PATH_INFO as the full script path.
-    let path_info = script_abs.display().to_string();
 
     let mut env = vec![
-        format!("GATEWAY_INTERFACE=CGI/1.1"),
+        "GATEWAY_INTERFACE=CGI/1.1".to_string(),
         format!("SERVER_PROTOCOL={}", req.version),
         format!("REQUEST_METHOD={}", req.method),
         format!("QUERY_STRING={query}"),
@@ -214,7 +233,14 @@ fn build_env(
             req.header("content-type").unwrap_or("")
         ),
         format!("SCRIPT_FILENAME={}", script_abs.display()),
-        format!("PATH_INFO={path_info}"),
+        // RFC 3875: PATH_INFO is the URL path, not a filesystem path — the
+        // trailing path segments after the script name, no query string.
+        // This project doesn't split a script name from extra trailing
+        // segments (routes resolve the whole remaining path straight to a
+        // file), so for the common case PATH_INFO mirrors SCRIPT_NAME, same
+        // as most minimal CGI setups do when there's no "extra path" to
+        // report.
+        format!("PATH_INFO={url_path}"),
         format!("SCRIPT_NAME={url_path}"),
         format!("SERVER_NAME={server_name}"),
         format!("SERVER_PORT={}", listen.port()),
@@ -229,160 +255,22 @@ fn build_env(
     env
 }
 
-fn feed_stdin(fd: RawFd, body: &[u8]) -> io::Result<()> {
-    let mut off = 0usize;
-    while off < body.len() {
-        let n = unsafe {
-            libc::write(
-                fd,
-                body[off..].as_ptr() as *const libc::c_void,
-                body.len() - off,
-            )
-        };
-        if n < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(err);
-        }
-        if n == 0 {
-            break;
-        }
-        off += n as usize;
-    }
-    Ok(())
-}
-
-fn drain_stdout(fd: RawFd, child: pid_t) -> Result<Vec<u8>, CgiFail> {
-    set_nonblock(fd)?;
-    let deadline = Instant::now() + CGI_TIMEOUT;
-    let mut out = Vec::new();
-    let mut buf = [0u8; READ_CHUNK];
-    let mut eof = false;
-
-    while !eof {
-        let remain = deadline.saturating_duration_since(Instant::now());
-        if remain.is_zero() {
-            return Err(CgiFail::Timeout);
-        }
-
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ms = remain.as_millis().min(i32::MAX as u128) as c_int;
-        let pr = unsafe { libc::poll(&mut pfd, 1, ms) };
-        if pr < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(CgiFail::Io);
-        }
-        if pr == 0 {
-            // Timed out waiting for more output — check if child already exited.
-            if child_exited(child) {
-                // Drain any remaining bytes without blocking long.
-                loop {
-                    let n = unsafe {
-                        libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-                    };
-                    if n <= 0 {
-                        break;
-                    }
-                    out.extend_from_slice(&buf[..n as usize]);
-                }
-                break;
-            }
-            return Err(CgiFail::Timeout);
-        }
-
-        if pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-            loop {
-                let n =
-                    unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-                if n > 0 {
-                    out.extend_from_slice(&buf[..n as usize]);
-                    continue;
-                }
-                if n == 0 {
-                    eof = true;
-                    break;
-                }
-                let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::WouldBlock {
-                    break;
-                }
-                if err.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(CgiFail::Io);
-            }
-        }
-    }
-
-    Ok(out)
-}
-
-fn reap(pid: pid_t) -> Result<(), CgiFail> {
-    let deadline = Instant::now() + CGI_TIMEOUT;
-    let mut status: c_int = 0;
-    loop {
-        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-        if r == pid {
-            return Ok(());
-        }
-        if r < 0 {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::ECHILD) {
-                return Ok(());
-            }
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(CgiFail::Io);
-        }
-        if Instant::now() >= deadline {
-            kill_wait(pid);
-            return Err(CgiFail::Timeout);
-        }
-        // Brief yield without a dedicated thread sleep API dependency beyond std.
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
-fn child_exited(pid: pid_t) -> bool {
-    let mut status: c_int = 0;
-    let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-    r == pid || (r < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
-}
-
-fn kill_wait(pid: pid_t) {
-    unsafe {
-        libc::kill(pid, libc::SIGKILL);
-        let mut status: c_int = 0;
-        let _ = libc::waitpid(pid, &mut status, 0);
-    }
-}
-
-fn make_pipe() -> Result<(RawFd, RawFd), CgiFail> {
+fn make_pipe() -> Result<(RawFd, RawFd), ()> {
     let mut fds = [0 as c_int; 2];
     let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
     if rc < 0 {
-        return Err(CgiFail::Io);
+        return Err(());
     }
     Ok((fds[0], fds[1]))
 }
 
-fn set_nonblock(fd: RawFd) -> Result<(), CgiFail> {
+fn set_nonblock(fd: RawFd) -> Result<(), ()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
-        return Err(CgiFail::Io);
+        return Err(());
     }
     if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(CgiFail::Io);
+        return Err(());
     }
     Ok(())
 }
@@ -390,6 +278,14 @@ fn set_nonblock(fd: RawFd) -> Result<(), CgiFail> {
 fn close_fd(fd: RawFd) {
     unsafe {
         let _ = libc::close(fd);
+    }
+}
+
+fn kill_and_forget(pid: pid_t) {
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+        let mut status: c_int = 0;
+        libc::waitpid(pid, &mut status, 0);
     }
 }
 
@@ -463,8 +359,7 @@ fn split_cgi_parts(raw: &[u8]) -> Option<(&[u8], &[u8])> {
 }
 
 fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len())
-        .position(|w| w == needle)
+    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(test)]
@@ -473,6 +368,7 @@ mod tests {
     use crate::settings::HttpMethod;
     use std::collections::HashMap;
     use std::fs;
+    use std::os::fd::AsRawFd;
 
     #[test]
     fn extension_match_is_case_insensitive() {
@@ -509,6 +405,70 @@ mod tests {
         let out = parse_cgi_stdout(raw);
         assert_eq!(out.status, 200);
         assert_eq!(out.body, b"<body>ok</body>");
+    }
+
+    /// Test-only synchronous drain: real epoll-driven feeding/draining is
+    /// exercised end-to-end by `tests/integration.sh`. Here we only need to
+    /// prove `plan()` + `spawn()` — the exact functions the hub calls —
+    /// produce a working child, so a simple blocking poll loop is fine; this
+    /// helper never runs on the server's hot path.
+    fn drain_for_test(mut spawned: SpawnedCgi, body: &[u8]) -> Vec<u8> {
+        if let Some(stdin) = spawned.stdin.take() {
+            let fd = stdin.as_raw_fd();
+            let mut off = 0usize;
+            while off < body.len() {
+                let n = unsafe {
+                    libc::write(
+                        fd,
+                        body[off..].as_ptr() as *const libc::c_void,
+                        body.len() - off,
+                    )
+                };
+                if n < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::WouldBlock {
+                        let mut pfd = libc::pollfd {
+                            fd,
+                            events: libc::POLLOUT,
+                            revents: 0,
+                        };
+                        unsafe { libc::poll(&mut pfd, 1, 1000) };
+                        continue;
+                    }
+                    break;
+                }
+                off += n as usize;
+            }
+            drop(stdin);
+        }
+
+        let out_fd = spawned.stdout.as_raw_fd();
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = unsafe { libc::read(out_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n > 0 {
+                out.extend_from_slice(&buf[..n as usize]);
+                continue;
+            }
+            if n == 0 {
+                break;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                let mut pfd = libc::pollfd {
+                    fd: out_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                unsafe { libc::poll(&mut pfd, 1, 1000) };
+                continue;
+            }
+            break;
+        }
+        let mut status: c_int = 0;
+        unsafe { libc::waitpid(spawned.pid, &mut status, 0) };
+        out
     }
 
     #[test]
@@ -553,14 +513,20 @@ mod tests {
             body: b"payload".to_vec(),
         };
         let listen: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        let out = handle(&site, &rule, &req, "/echo.py", listen, false);
+
+        let cgi_plan = plan(&site, &rule, &req, "/echo.py", listen, false).expect("plan");
+        let spawned = spawn(&cgi_plan).expect("spawn");
+        let raw = drain_for_test(spawned, &cgi_plan.body);
+        let out = finish(&raw, false);
+
         assert_eq!(out.status, 200, "body={}", String::from_utf8_lossy(&out.body));
         let text = String::from_utf8_lossy(&out.body);
         assert!(text.contains("METHOD=POST"));
         assert!(text.contains("BODY=payload"));
-        assert!(text.contains("PATH_INFO="));
-        // PATH_INFO must be the absolute script path.
-        assert!(text.contains(script.canonicalize().unwrap().display().to_string().as_str()));
+        // RFC 3875: PATH_INFO is the request's URL path, not a filesystem
+        // path (see the comment in build_env for why it mirrors SCRIPT_NAME
+        // here rather than the absolute script path).
+        assert!(text.contains("PATH_INFO=/echo.py"));
 
         let _ = fs::remove_dir_all(&dir);
     }
