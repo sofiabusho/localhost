@@ -17,13 +17,18 @@ pub use verify::validate;
 
 use std::path::Path;
 
-/// Load and validate a configuration file.
+/// Load and validate a configuration file. A site that fails its own
+/// schema check is dropped (logged here) rather than failing the whole
+/// load — see `verify::validate` for the fatal/non-fatal distinction.
 pub fn load(path: &Path) -> Result<SiteBundle, String> {
     let text = std::fs::read_to_string(path).map_err(|e| {
         format!("cannot read config '{}': {e}", path.display())
     })?;
-    let bundle = load::parse_source(&text)?;
-    verify::validate(&bundle)?;
+    let mut bundle = load::parse_source(&text)?;
+    let warnings = verify::validate(&mut bundle)?;
+    for w in &warnings {
+        eprintln!("localhost: config warning: {w}");
+    }
     Ok(bundle)
 }
 
@@ -32,8 +37,8 @@ mod tests {
     use super::*;
 
     fn parse_ok(src: &str) -> SiteBundle {
-        let bundle = load::parse_source(src).expect("parse");
-        verify::validate(&bundle).expect("validate");
+        let mut bundle = load::parse_source(src).expect("parse");
+        verify::validate(&mut bundle).expect("validate");
         bundle
     }
 
@@ -86,8 +91,8 @@ site {
     path / { methods GET; root www; }
 }
 "#;
-        let bundle = load::parse_source(src).expect("parse");
-        let err = verify::validate(&bundle).expect_err("dup ports");
+        let mut bundle = load::parse_source(src).expect("parse");
+        let err = verify::validate(&mut bundle).expect_err("dup ports");
         assert!(err.contains("9000") || err.to_lowercase().contains("port"));
     }
 
@@ -123,8 +128,8 @@ site {
     path / { methods GET; root other; }
 }
 "#;
-        let bundle = load::parse_source(src).expect("parse");
-        let err = verify::validate(&bundle).expect_err("needs names");
+        let mut bundle = load::parse_source(src).expect("parse");
+        let err = verify::validate(&mut bundle).expect_err("needs names");
         assert!(err.to_lowercase().contains("name") || err.contains("shared"));
     }
 
@@ -142,8 +147,8 @@ site {
     path / { methods GET; root other; }
 }
 "#;
-        let bundle = load::parse_source(src).expect("parse");
-        let err = verify::validate(&bundle).expect_err("dup hostname");
+        let mut bundle = load::parse_source(src).expect("parse");
+        let err = verify::validate(&mut bundle).expect_err("dup hostname");
         assert!(err.to_lowercase().contains("hostname") || err.contains("duplicate"));
     }
 
@@ -155,8 +160,40 @@ site {
     path / { methods GET; root www; }
 }
 "#;
-        let bundle = load::parse_source(src).expect("parse");
-        assert!(verify::validate(&bundle).is_err());
+        let mut bundle = load::parse_source(src).expect("parse");
+        assert!(verify::validate(&mut bundle).is_err());
+    }
+
+    #[test]
+    fn drops_invalid_site_keeps_valid_sibling_on_shared_port() {
+        // audit.md: "If one of these configurations isn't valid... your
+        // server should continue to function for the other
+        // configurations." Two sites share one bind with distinct names
+        // (so check_shared_binds is happy) but one has a path block with
+        // neither 'root' nor 'redirect' — a per-site schema error, not a
+        // port/bind conflict, so it must not take 'good.local' down too.
+        let src = r#"
+site {
+    bind 127.0.0.1:19081;
+    name good.local;
+    path / { methods GET; root www; }
+}
+site {
+    bind 127.0.0.1:19081;
+    name broken.local;
+    path / { methods GET; }
+}
+"#;
+        let mut bundle = load::parse_source(src).expect("parse");
+        let warnings =
+            verify::validate(&mut bundle).expect("an individually-invalid site must not error the whole bundle");
+
+        assert_eq!(bundle.sites.len(), 1, "only the valid site should remain");
+        assert_eq!(bundle.sites[0].hostnames, vec!["good.local".to_string()]);
+
+        assert_eq!(warnings.len(), 1, "the broken site should be reported once");
+        assert!(warnings[0].contains("site#1"));
+        assert!(warnings[0].contains("root") || warnings[0].contains("redirect"));
     }
 
     #[test]

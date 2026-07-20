@@ -1,37 +1,93 @@
 //! Semantic checks on a parsed SiteBundle.
+//!
+//! Two very different kinds of "invalid" are handled here, on purpose:
+//!
+//! - **Fatal, whole-process** errors: a site trying to bind the same
+//!   address twice, or two sites disagreeing over a shared address/port
+//!   (`check_shared_binds`, `check_port_collisions`). These aren't
+//!   scoped to one site — they're about how sites relate to each other on
+//!   the network, and there's no sane way to "drop one side" of a port
+//!   conflict, so `validate` still aborts config loading entirely for
+//!   these (matches audit.md's "Configure the same port multiple times —
+//!   the server should find the error").
+//! - **Non-fatal, site-scoped** errors: one individual site's own schema
+//!   is broken (no bind, no path blocks, a path missing `root`/`redirect`,
+//!   etc. — see `check_site_schema`/`check_path`). These can't affect any
+//!   other site, so audit.md's other requirement applies instead: "if one
+//!   of these configurations isn't valid... your server should continue
+//!   to function for the other configurations." Such a site is dropped
+//!   from the bundle and reported as a warning by the caller instead of
+//!   failing the whole process.
 
-use super::schema::{PathRule, SiteBundle};
+use super::schema::{PathRule, SiteBlock, SiteBundle};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 
-pub fn validate(bundle: &SiteBundle) -> Result<(), String> {
+/// Validate `bundle` in place, dropping any individually-invalid site.
+///
+/// Returns `Ok(warnings)` — one line per dropped site — as long as at
+/// least one site survives. Returns `Err` only for whole-process-fatal
+/// problems: an empty bundle to begin with, a site binding the same
+/// address twice, a bind/port conflict between sites, or every site
+/// having been dropped as invalid (nothing left to serve).
+pub fn validate(bundle: &mut SiteBundle) -> Result<Vec<String>, String> {
     if bundle.sites.is_empty() {
         return Err("no site blocks configured".into());
     }
 
+    // Fatal: a single site binding the same address twice. This is a
+    // binding mistake, not a schema mistake — same category as the
+    // cross-site checks below, not the per-site ones further down.
     for (idx, site) in bundle.sites.iter().enumerate() {
         let label = format!("site#{idx}");
-        if site.binds.is_empty() {
-            return Err(format!("{label}: at least one 'bind' is required"));
-        }
-
         let mut local_binds = HashSet::new();
         for addr in &site.binds {
             if !local_binds.insert(*addr) {
                 return Err(format!("{label}: duplicate bind {addr} within the same site"));
             }
         }
+    }
 
-        if site.paths.is_empty() {
-            return Err(format!("{label}: at least one 'path' block is required"));
-        }
-        for path in &site.paths {
-            check_path(&label, path)?;
+    // Fatal: relationships BETWEEN sites over a shared address/port.
+    // Deliberately run against the full, unfiltered bundle — whether two
+    // sites conflict with each other doesn't depend on whether one of
+    // them will later turn out to also be individually invalid.
+    check_shared_binds(bundle)?;
+    check_port_collisions(bundle)?;
+
+    // Non-fatal: each site's own schema. A site that fails here is
+    // dropped — with a warning for the caller to log — instead of taking
+    // every other site down with it.
+    let mut warnings = Vec::new();
+    let sites = std::mem::take(&mut bundle.sites);
+    for (idx, site) in sites.into_iter().enumerate() {
+        let label = format!("site#{idx}");
+        match check_site_schema(&label, &site) {
+            Ok(()) => bundle.sites.push(site),
+            Err(e) => warnings.push(format!("{e} (site dropped)")),
         }
     }
 
-    check_shared_binds(bundle)?;
-    check_port_collisions(bundle)?;
+    if bundle.sites.is_empty() {
+        return Err("no usable site blocks remain after validation".into());
+    }
+
+    Ok(warnings)
+}
+
+/// One site's own schema: does it have what it needs to run at all,
+/// independent of every other site. Never touches `bundle` — a failure
+/// here can only ever affect this one site.
+fn check_site_schema(label: &str, site: &SiteBlock) -> Result<(), String> {
+    if site.binds.is_empty() {
+        return Err(format!("{label}: at least one 'bind' is required"));
+    }
+    if site.paths.is_empty() {
+        return Err(format!("{label}: at least one 'path' block is required"));
+    }
+    for path in &site.paths {
+        check_path(label, path)?;
+    }
     Ok(())
 }
 
