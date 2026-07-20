@@ -153,11 +153,16 @@ See [`docs/documentation.md`](docs/documentation.md) for the module-by-module
 walkthrough (key types, functions, how each module talks to its neighbors)
 and a full request-lifecycle trace.
 
-## Bonus
+## Bonus (incomplete)
 
 A second implementation of the server in C++ lives in [`cpp/`](cpp/) (own
 `Makefile`, `src/`, `include/`) — a separate build and runtime from the Rust
-version above.
+version above. It builds cleanly and handles static file serving, 404s, and
+malformed requests correctly, but upload and CGI are currently broken:
+uploads write the raw multipart body verbatim to a hardcoded filename
+instead of parsing it, and CGI requests resolve the script path incorrectly
+(so they return 200 with an empty body instead of running the script). Not
+ready to demonstrate as a working bonus.
 
 ## License
 
