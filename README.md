@@ -12,9 +12,11 @@ this codebase, module-by-module walkthrough, full config reference) see
 
 ## Authors
 
-- astas
-- ikopylova
-- sbusho
+
+- 🗂️ Iana Kopylova - [ikopylov](https://discordapp.com/users/1279339146833297509)
+- 👩‍💻 Sofia Busho - [sbusho](https://discordapp.com/users/1276592724979613697)
+- ✍️ Adriana Stas - [astas](https://discordapp.com/users/780150798927134740)
+
 
 ## Features
 
